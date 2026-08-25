@@ -5,12 +5,13 @@ import adi
 from PyQt5 import Qt
 import sip
 from gnuradio import gr, blocks, analog, digital, qtgui, filter, fft
+from custom_blocks import *
 
 # ---------------------------------------------------------
 #  EVM Block
 # ---------------------------------------------------------
 class evm_generic_block(gr.sync_block):
-    def __init__(self, constellation_points, window=2048, decimation=1):
+    def __init__(self, constellation_points, window=2048, skip_samples=4096):
         gr.sync_block.__init__(
             self,
             name="evm_generic",
@@ -19,45 +20,71 @@ class evm_generic_block(gr.sync_block):
         )
         self.ref = np.array(constellation_points, dtype=np.complex64)
         self.window = window
-        self.decimation = max(1, decimation)
-        self.sample_count = 0
+        self.skip_samples = skip_samples # 跳過前期的未鎖定瞬態
+        self.processed = 0
         self.buf = np.zeros(window, dtype=np.complex64)
         self.index = 0
         self.full = False
         self.ref_power = np.mean(np.abs(self.ref)**2) or 1e-12
         self.last_evm = 0.0
 
+        # 四種 QPSK 相位旋轉可能性 (0, 90, 180, 270 度)
+        self.rotations = [1.0, 1j, -1.0, -1j]
+
     def work(self, input_items, output_items):
         x = input_items[0]
         y = output_items[0]
         n = len(x)
 
-        start_idx = (self.decimation - (self.sample_count % self.decimation)) % self.decimation
-        self.sample_count += n
-        sub_x = x[start_idx::self.decimation]
+        # 拋棄開機瞬態數據
+        if self.processed < self.skip_samples:
+            take = min(n, self.skip_samples - self.processed)
+            self.processed += take
+            x = x[take:]
+            if len(x) == 0:
+                y[:] = self.last_evm
+                return n
 
+        sub_x = x
         if len(sub_x) > 0:
             if len(sub_x) > 4096:
                 sub_x = sub_x[-4096:]
 
-            dists = np.abs(sub_x[:, None] - self.ref[None, :])
-            min_indices = np.argmin(dists, axis=1)
-            ref_syms = self.ref[min_indices]
-            errs = sub_x - ref_syms
+            # 1. 嘗試 4 種相位旋轉，找出的 Costas 鎖定角度
+            best_errs = None
+            min_total_err = float('inf')
 
-            n_errs = len(errs)
+            for rot in self.rotations:
+                rot_x = sub_x * rot
+                
+                # 幅度最佳化 scaling
+                dists = np.abs(rot_x[:, None] - self.ref[None, :])
+                min_idx = np.argmin(dists, axis=1)
+                ref_syms = self.ref[min_idx]
+
+                scale = np.real(np.sum(rot_x * np.conj(ref_syms))) / (np.sum(np.abs(rot_x)**2) + 1e-12)
+                scaled_x = rot_x * scale
+                errs = scaled_x - ref_syms
+                
+                total_err = np.sum(np.abs(errs)**2)
+                if total_err < min_total_err:
+                    min_total_err = total_err
+                    best_errs = errs
+
+            # 2. 填入 Buffer 算 EVM
+            n_errs = len(best_errs)
             if n_errs >= self.window:
-                self.buf[:] = errs[-self.window:]
+                self.buf[:] = best_errs[-self.window:]
                 self.index = 0
                 self.full = True
             else:
                 space = self.window - self.index
                 if n_errs <= space:
-                    self.buf[self.index:self.index + n_errs] = errs
+                    self.buf[self.index:self.index + n_errs] = best_errs
                     self.index += n_errs
                 else:
-                    self.buf[self.index:] = errs[:space]
-                    self.buf[:n_errs - space] = errs[space:]
+                    self.buf[self.index:] = best_errs[:space]
+                    self.buf[:n_errs - space] = best_errs[space:]
                     self.index = n_errs - space
                     self.full = True
 
@@ -245,6 +272,7 @@ class qpsk_cable_demo(gr.top_block):
             rx_lo=915e6,
             buf_len=buf_len
         )
+        #self.pluto = FakePlutoSDR(fifo_size=buf_len*8,samp_rate=samp_rate,freq_offset_hz=0.0 )
 
         self.freq_sink = qtgui.freq_sink_c(
             2048,
@@ -273,9 +301,11 @@ class qpsk_cable_demo(gr.top_block):
         )
         self.evm_sink.set_title("EVM (%)")
         self.evm_sink.set_update_time(2.0)
+        self.evm_sink.set_min(0, -20)
+        self.evm_sink.set_max(0, 20)
         self.evm_sink_win = sip.wrapinstance(self.evm_sink.qwidget(), Qt.QWidget)
 
-        self.evm = evm_generic_block(points, window=2048, decimation=1)
+        self.evm = evm_generic_block(points, window=2048,skip_samples=2408)
 
         self.connect(self.src, self.tx, self.pluto)
         self.connect(self.pluto, self.freq_sink)

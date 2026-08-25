@@ -4,22 +4,19 @@ import numpy as np
 import adi
 from PyQt5 import Qt
 import sip
-
 from gnuradio import gr, blocks, analog, digital, qtgui, filter, fft
-
 
 # ---------------------------------------------------------
 #  EVM Block
 # ---------------------------------------------------------
 class evm_generic_block(gr.sync_block):
-    def __init__(self, constellation_points, window=2048, decimation=16):
+    def __init__(self, constellation_points, window=2048, decimation=1):
         gr.sync_block.__init__(
             self,
             name="evm_generic",
             in_sig=[np.complex64],
             out_sig=[np.float32],
         )
-
         self.ref = np.array(constellation_points, dtype=np.complex64)
         self.window = window
         self.decimation = max(1, decimation)
@@ -71,7 +68,6 @@ class evm_generic_block(gr.sync_block):
         y[:] = self.last_evm
         return n
 
-
 # ---------------------------------------------------------
 #  PlutoSDR TX/RX Block
 # ---------------------------------------------------------
@@ -86,6 +82,10 @@ class PlutoIO(gr.sync_block):
         self.buf_len = buf_len
         self.sdr = sdr
         self.set_output_multiple(buf_len)
+        
+        # 清除幾幀 Buffer 避免初始無效數據衝擊同步器
+        for _ in range(3):
+            _ = self.sdr.rx()
 
     def work(self, input_items, output_items):
         in_data = input_items[0]
@@ -94,7 +94,6 @@ class PlutoIO(gr.sync_block):
 
         for i in range(0, n_out, self.buf_len):
             end = min(i + self.buf_len, n_out)
-
             tx_chunk = in_data[i:end]
             if len(tx_chunk) > 0:
                 self.sdr.tx(tx_chunk)
@@ -103,7 +102,6 @@ class PlutoIO(gr.sync_block):
             out_data[i:end] = rx_chunk[:(end - i)]
 
         return n_out
-
 
 class PlutoSDR_txrx_stream(gr.hier_block2):
     def __init__(self, uri="ip:192.168.2.1", samp_rate=1_000_000,
@@ -119,27 +117,26 @@ class PlutoSDR_txrx_stream(gr.hier_block2):
         self.sdr = adi.Pluto(uri)
         self.sdr.sample_rate = int(samp_rate)
 
+        # 優化 RF Front-end 增益配置
         self.sdr.tx_lo = int(tx_lo)
-        self.sdr.tx_hardwaregain_chan0 = -10
+        self.sdr.tx_hardwaregain_chan0 = -5 # 提高 TX 增益減少衰減
         self.sdr.tx_buffer_size = buf_len
         self.sdr.tx_cyclic_buffer = False
 
         self.sdr.rx_lo = int(rx_lo)
         self.sdr.gain_control_mode_chan0 = 'manual'
-        self.sdr.rx_hardwaregain_chan0 = 10
+        self.sdr.rx_hardwaregain_chan0 = 25 # 適度調降以提高 SNR
         self.sdr.rx_buffer_size = buf_len
         self.sdr.rx_rf_bandwidth = int(samp_rate * 2)
 
-        self.tx_scale = blocks.multiply_const_cc(10000.0)
-        self.rx_scale = blocks.multiply_const_cc(1.0 / 10000.0)
+        self.tx_scale = blocks.multiply_const_cc(4000.0)
+        self.rx_scale = blocks.multiply_const_cc(1.0 / 4000.0)
 
         self.pluto_io = PlutoIO(buf_len, self.sdr)
-
         self.connect(self, self.tx_scale, self.pluto_io, self.rx_scale, self)
 
-
 # ---------------------------------------------------------
-#  QPSK TX Block（修正 input 連接）
+#  QPSK TX Block
 # ---------------------------------------------------------
 class QPSK_TX_block(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, rolloff=0.35):
@@ -151,7 +148,7 @@ class QPSK_TX_block(gr.hier_block2):
         )
 
         sym_rate = samp_rate // sps
-        ntaps = 11 * sps + 1
+        ntaps = 15 * sps + 1 # 提升 FIR Taps 減少邊緣衰減與 ISI
 
         const = digital.constellation_qpsk().base()
         points = const.points()
@@ -169,9 +166,7 @@ class QPSK_TX_block(gr.hier_block2):
             )
         )
 
-        # 修正：外部輸入 → mapper → RRC → output
         self.connect(self, self.mapper, self.rrc_tx, self)
-
 
 # ---------------------------------------------------------
 #  QPSK RX Block
@@ -186,7 +181,7 @@ class QPSK_RX_block(gr.hier_block2):
         )
 
         sym_rate = samp_rate // sps
-        ntaps = 11 * sps + 1
+        ntaps = 15 * sps + 1
 
         rrc_taps = filter.firdes.root_raised_cosine(
             gain=1.0,
@@ -200,10 +195,11 @@ class QPSK_RX_block(gr.hier_block2):
         self.agc = analog.agc2_cc(1e-2, 1e-3, 1.0, 1.0)
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
+        # 改用 M&M TED 算法並調精細增益以收緊星座點
         self.clock_sync = digital.symbol_sync_cc(
-            digital.TED_GARDNER,
+            digital.TED_MUELLER_AND_MULLER,
             sps,
-            0.015,
+            0.004, # 細微迴路頻寬降低相位抖動
             1.0,
             1.0,
             1.5,
@@ -212,14 +208,13 @@ class QPSK_RX_block(gr.hier_block2):
             digital.IR_MMSE_8TAP
         )
 
+        # 鎖定殘留相偏
         self.costas = digital.costas_loop_cc(0.015, 4, False)
         self.copy = blocks.copy(gr.sizeof_gr_complex)
 
         self.connect(self, self.dc_block, self.agc, self.rrc_rx,
                      self.clock_sync, self.costas, self.copy)
-
         self.connect(self.copy, self)
-
 
 # ---------------------------------------------------------
 #  主程式
@@ -233,18 +228,16 @@ class qpsk_cable_demo(gr.top_block):
         buf_len = 32768
 
         const = digital.constellation_qpsk().base()
-        points = const.points()
+        raw_pts = np.array(const.points(), dtype=np.complex64)
+        points = raw_pts / np.abs(raw_pts[0])
 
-        # TX bit source
         n_symbols = 200000
         rnd = np.random.randint(0, 4, n_symbols).tolist()
         self.src = blocks.vector_source_b(rnd, repeat=True)
 
-        # TX / RX blocks
         self.tx = QPSK_TX_block(sps=sps, samp_rate=samp_rate)
         self.rx = QPSK_RX_block(sps=sps, samp_rate=samp_rate)
 
-        # Pluto SDR
         self.pluto = PlutoSDR_txrx_stream(
             uri="ip:192.168.2.1",
             samp_rate=samp_rate,
@@ -253,7 +246,6 @@ class qpsk_cable_demo(gr.top_block):
             buf_len=buf_len
         )
 
-        # Spectrum
         self.freq_sink = qtgui.freq_sink_c(
             2048,
             fft.window.WIN_HAMMING,
@@ -263,7 +255,6 @@ class qpsk_cable_demo(gr.top_block):
         )
         self.freq_win = sip.wrapinstance(self.freq_sink.qwidget(), Qt.QWidget)
 
-        # Constellation
         self.const_sink = qtgui.const_sink_c(
             4096,
             "Cable Loopback QPSK (1MHz)",
@@ -273,7 +264,6 @@ class qpsk_cable_demo(gr.top_block):
         self.const_sink.set_y_axis(-2.0, 2.0)
         self.const_win = sip.wrapinstance(self.const_sink.qwidget(), Qt.QWidget)
 
-        # EVM
         self.evm_sink = qtgui.number_sink(
             gr.sizeof_float,
             0.5,
@@ -282,22 +272,17 @@ class qpsk_cable_demo(gr.top_block):
             None
         )
         self.evm_sink.set_title("EVM (%)")
-        self.evm_sink.set_update_time(4.0)
+        self.evm_sink.set_update_time(2.0)
         self.evm_sink_win = sip.wrapinstance(self.evm_sink.qwidget(), Qt.QWidget)
 
-        self.evm = evm_generic_block(points, window=2048, decimation=16)
+        self.evm = evm_generic_block(points, window=2048, decimation=1)
 
-        # Connections
         self.connect(self.src, self.tx, self.pluto)
         self.connect(self.pluto, self.freq_sink)
         self.connect(self.pluto, self.rx)
         self.connect(self.rx, self.const_sink)
         self.connect(self.rx, self.evm, self.evm_sink)
 
-
-# ---------------------------------------------------------
-#  run_demo()
-# ---------------------------------------------------------
 def run_demo():
     app = Qt.QApplication(sys.argv)
     tb = qpsk_cable_demo()
@@ -313,7 +298,6 @@ def run_demo():
     app.exec_()
     tb.stop()
     tb.wait()
-
 
 if __name__ == "__main__":
     run_demo()

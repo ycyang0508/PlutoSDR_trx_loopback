@@ -4,68 +4,6 @@ import adi
 import sip
 from gnuradio import gr, blocks
 
-class q15_tx(gr.sync_block):
-    """
-    TX: complex64 → Q1.15 int16
-    """
-
-
-    def __init__(self):
-        gr.sync_block.__init__(
-            self,
-            name="q15_tx",
-            in_sig=[np.complex64],
-            out_sig=[np.complex64]   # Pluto TX block 仍然吃 complex64，但內容是 int16
-        )
-        self.scale = 2**15 #32768.0 
-
-
-    def work(self, input_items, output_items):
-        x = input_items[0]
-
-        # float → Q1.15
-        i_float = np.clip(x.real, -1.0, 0.999969) * self.scale
-        q_float = np.clip(x.imag, -1.0, 0.999969) * self.scale
-
-        i_int16 = i_float.astype(np.int16)
-        q_int16 = q_float.astype(np.int16)
-
-        # 轉成 complex64，但內容是 int16
-        output_items[0][:] = i_int16.astype(np.float32) + 1j * q_int16.astype(np.float32)
-
-        return len(output_items[0])
-
-
-class q15_rx(gr.sync_block):
-    """
-    RX: Q1.15 int16 → complex64
-    """
-
-    def __init__(self):
-        gr.sync_block.__init__(
-            self,
-            name="q15_rx",
-            in_sig=[np.complex64],   # Pluto RX block 輸出 complex64，但內容是 int16
-            out_sig=[np.complex64]
-        )
-        self.scale = 2**5  #32767.0
-
-    def work(self, input_items, output_items):
-        x = input_items[0]
-
-        # complex64 → int16
-        i_int16 = x.real.astype(np.int16)
-        q_int16 = x.imag.astype(np.int16)
-
-        # int16 → float
-        i_float = i_int16.astype(np.float32) / self.scale
-        q_float = q_int16.astype(np.float32) / self.scale
-
-        output_items[0][:] = i_float + 1j * q_float
-        return len(output_items[0])
-
-
-
 # ---------------------------------------------------------
 # Fake PlutoSDR with FIFO + frequency offset
 # ---------------------------------------------------------
@@ -112,3 +50,78 @@ class FakePlutoSDR(gr.sync_block):
                 self.phase -= 2 * np.pi
 
         return out_n
+
+
+
+
+class PlutoSDR_txrx_stream(gr.hier_block2):
+    def __init__(self, uri="ip:192.168.2.1", samp_rate=1_000_000,
+                 tx_lo=915e6, rx_lo=915e6, buf_len=16384):
+
+        gr.hier_block2.__init__(
+            self,
+            "pluto_txrx_stream",
+            gr.io_signature(1, 1, gr.sizeof_gr_complex),
+            gr.io_signature(1, 1, gr.sizeof_gr_complex),
+        )
+
+        self.buf_len = buf_len
+
+        # Pluto SDR 初始化
+        self.sdr = adi.Pluto(uri)
+        self.sdr.sample_rate = int(samp_rate)
+
+        # TX 設定
+        self.sdr.tx_lo = int(tx_lo)
+        self.sdr.tx_hardwaregain_chan0 = -10
+        self.sdr.tx_buffer_size = buf_len
+        self.sdr.tx_cyclic_buffer = False
+
+        # RX 設定
+        self.sdr.rx_lo = int(rx_lo)
+        self.sdr.gain_control_mode_chan0 = 'manual'
+        self.sdr.rx_hardwaregain_chan0 = 10
+        self.sdr.rx_buffer_size = buf_len
+        self.sdr.rx_rf_bandwidth = int(samp_rate * 2)
+
+        # GNU Radio 內建乘法 block（TX 放大）
+        self.tx_scale = blocks.multiply_const_cc(2**14)
+
+        # GNU Radio 內建乘法 block（RX 縮小）
+        self.rx_scale = blocks.multiply_const_cc(1/(2**14))
+
+        # Pluto I/O block（純 Python）
+        self.pluto_io = PlutoIO(buf_len, self.sdr)
+
+        # Connect internal blocks
+        self.connect(self, self.tx_scale, self.pluto_io, self.rx_scale, self)
+        
+
+class PlutoIO(gr.sync_block):
+    def __init__(self, buf_len, sdr):
+        gr.sync_block.__init__(
+            self,
+            name="pluto_io",
+            in_sig=[np.complex64],
+            out_sig=[np.complex64]
+        )
+        self.buf_len = buf_len
+        self.sdr = sdr
+        self.set_output_multiple(buf_len)
+
+    def work(self, input_items, output_items):
+        in_data = input_items[0]
+        out_data = output_items[0]
+        n_out = len(out_data)
+
+        for i in range(0, n_out, self.buf_len):
+            end = min(i + self.buf_len, n_out)
+
+            tx_chunk = in_data[i:end]
+            if len(tx_chunk) > 0:
+                self.sdr.tx(tx_chunk)
+
+            rx_chunk = self.sdr.rx()
+            out_data[i:end] = rx_chunk[:(end - i)]
+
+        return n_out

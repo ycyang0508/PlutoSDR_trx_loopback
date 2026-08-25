@@ -23,7 +23,6 @@
   <ItemGroup>
     <Compile Include="custom_blocks.py" />
     <Compile Include="pluto_loopback_demo.py" />
-    <Compile Include="PlutoSDR_trx.py" />
     <Compile Include="PlutoSDR_trx_loopback.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />

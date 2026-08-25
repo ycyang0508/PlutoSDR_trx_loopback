@@ -8,10 +8,10 @@ from gnuradio import gr, blocks, analog, digital, qtgui, filter, fft
 from custom_blocks import *
 
 # ---------------------------------------------------------
-#  EVM Block
+#  EVM Block (具備自動 Scaling 與 Rotations 判斷)
 # ---------------------------------------------------------
 class evm_generic_block(gr.sync_block):
-    def __init__(self, constellation_points, window=2048, skip_samples=4096):
+    def __init__(self, constellation_points, window=2048, skip_samples=8192):
         gr.sync_block.__init__(
             self,
             name="evm_generic",
@@ -20,7 +20,7 @@ class evm_generic_block(gr.sync_block):
         )
         self.ref = np.array(constellation_points, dtype=np.complex64)
         self.window = window
-        self.skip_samples = skip_samples # 跳過前期的未鎖定瞬態
+        self.skip_samples = skip_samples
         self.processed = 0
         self.buf = np.zeros(window, dtype=np.complex64)
         self.index = 0
@@ -28,7 +28,6 @@ class evm_generic_block(gr.sync_block):
         self.ref_power = np.mean(np.abs(self.ref)**2) or 1e-12
         self.last_evm = 0.0
 
-        # 四種 QPSK 相位旋轉可能性 (0, 90, 180, 270 度)
         self.rotations = [1.0, 1j, -1.0, -1j]
 
     def work(self, input_items, output_items):
@@ -36,7 +35,6 @@ class evm_generic_block(gr.sync_block):
         y = output_items[0]
         n = len(x)
 
-        # 拋棄開機瞬態數據
         if self.processed < self.skip_samples:
             take = min(n, self.skip_samples - self.processed)
             self.processed += take
@@ -50,18 +48,17 @@ class evm_generic_block(gr.sync_block):
             if len(sub_x) > 4096:
                 sub_x = sub_x[-4096:]
 
-            # 1. 嘗試 4 種相位旋轉，找出的 Costas 鎖定角度
             best_errs = None
             min_total_err = float('inf')
 
             for rot in self.rotations:
                 rot_x = sub_x * rot
                 
-                # 幅度最佳化 scaling
                 dists = np.abs(rot_x[:, None] - self.ref[None, :])
                 min_idx = np.argmin(dists, axis=1)
                 ref_syms = self.ref[min_idx]
 
+                # Least Squares 擬合的最佳幅度縮放比例
                 scale = np.real(np.sum(rot_x * np.conj(ref_syms))) / (np.sum(np.abs(rot_x)**2) + 1e-12)
                 scaled_x = rot_x * scale
                 errs = scaled_x - ref_syms
@@ -71,7 +68,6 @@ class evm_generic_block(gr.sync_block):
                     min_total_err = total_err
                     best_errs = errs
 
-            # 2. 填入 Buffer 算 EVM
             n_errs = len(best_errs)
             if n_errs >= self.window:
                 self.buf[:] = best_errs[-self.window:]
@@ -96,7 +92,7 @@ class evm_generic_block(gr.sync_block):
         return n
 
 # ---------------------------------------------------------
-#  PlutoSDR TX/RX Block
+#  PlutoSDR TX/RX Block (開啟硬體 IQ / DC 追蹤校正)
 # ---------------------------------------------------------
 class PlutoIO(gr.sync_block):
     def __init__(self, buf_len, sdr):
@@ -110,8 +106,7 @@ class PlutoIO(gr.sync_block):
         self.sdr = sdr
         self.set_output_multiple(buf_len)
         
-        # 清除幾幀 Buffer 避免初始無效數據衝擊同步器
-        for _ in range(3):
+        for _ in range(5):
             _ = self.sdr.rx()
 
     def work(self, input_items, output_items):
@@ -144,15 +139,22 @@ class PlutoSDR_txrx_stream(gr.hier_block2):
         self.sdr = adi.Pluto(uri)
         self.sdr.sample_rate = int(samp_rate)
 
-        # 優化 RF Front-end 增益配置
+        # 啟用 AD9361 晶片內建的正交 (IQ Imbalance) 與 DC 偏置硬體追蹤
+        try:
+            self.sdr.quadrature_tracking_en = True
+        #    self.sdr.rfdc_tracking_en = True
+            self.sdr.bbdc_tracking_en = True
+        except AttributeError:
+            pass
+
         self.sdr.tx_lo = int(tx_lo)
-        self.sdr.tx_hardwaregain_chan0 = -5 # 提高 TX 增益減少衰減
+        self.sdr.tx_hardwaregain_chan0 = -18  # 降低發射功率，確保完美的線性度
         self.sdr.tx_buffer_size = buf_len
         self.sdr.tx_cyclic_buffer = False
 
         self.sdr.rx_lo = int(rx_lo)
         self.sdr.gain_control_mode_chan0 = 'manual'
-        self.sdr.rx_hardwaregain_chan0 = 25 # 適度調降以提高 SNR
+        self.sdr.rx_hardwaregain_chan0 = 10   # 降低接收增益，防止混頻器輕微飽和
         self.sdr.rx_buffer_size = buf_len
         self.sdr.rx_rf_bandwidth = int(samp_rate * 2)
 
@@ -175,7 +177,7 @@ class QPSK_TX_block(gr.hier_block2):
         )
 
         sym_rate = samp_rate // sps
-        ntaps = 15 * sps + 1 # 提升 FIR Taps 減少邊緣衰減與 ISI
+        ntaps = 15 * sps + 1
 
         const = digital.constellation_qpsk().base()
         points = const.points()
@@ -196,7 +198,7 @@ class QPSK_TX_block(gr.hier_block2):
         self.connect(self, self.mapper, self.rrc_tx, self)
 
 # ---------------------------------------------------------
-#  QPSK RX Block
+#  QPSK RX Block (優化 DC 濾除與環路參數)
 # ---------------------------------------------------------
 class QPSK_RX_block(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, rolloff=0.35):
@@ -218,15 +220,15 @@ class QPSK_RX_block(gr.hier_block2):
             ntaps=ntaps
         )
 
-        self.dc_block = filter.dc_blocker_cc(128, True)
-        self.agc = analog.agc2_cc(1e-2, 1e-3, 1.0, 1.0)
+        # 改用 4096 長度的 DC Blocker，更精確剔除 Zero-IF 的零頻率成分而不干擾帶內訊號
+        self.dc_block = filter.dc_blocker_cc(4096, True)
+        self.agc = analog.agc2_cc(1e-2, 1e-3, 1.41421356, 1.0)
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
-        # 改用 M&M TED 算法並調精細增益以收緊星座點
         self.clock_sync = digital.symbol_sync_cc(
             digital.TED_MUELLER_AND_MULLER,
             sps,
-            0.004, # 細微迴路頻寬降低相位抖動
+            0.0015,
             1.0,
             1.0,
             1.5,
@@ -235,8 +237,7 @@ class QPSK_RX_block(gr.hier_block2):
             digital.IR_MMSE_8TAP
         )
 
-        # 鎖定殘留相偏
-        self.costas = digital.costas_loop_cc(0.015, 4, False)
+        self.costas = digital.costas_loop_cc(0.0015, 4, False)
         self.copy = blocks.copy(gr.sizeof_gr_complex)
 
         self.connect(self, self.dc_block, self.agc, self.rrc_rx,
@@ -272,7 +273,6 @@ class qpsk_cable_demo(gr.top_block):
             rx_lo=915e6,
             buf_len=buf_len
         )
-        #self.pluto = FakePlutoSDR(fifo_size=buf_len*8,samp_rate=samp_rate,freq_offset_hz=0.0 )
 
         self.freq_sink = qtgui.freq_sink_c(
             2048,
@@ -284,7 +284,7 @@ class qpsk_cable_demo(gr.top_block):
         self.freq_win = sip.wrapinstance(self.freq_sink.qwidget(), Qt.QWidget)
 
         self.const_sink = qtgui.const_sink_c(
-            4096,
+            1024,
             "Cable Loopback QPSK (1MHz)",
             1
         )
@@ -305,7 +305,7 @@ class qpsk_cable_demo(gr.top_block):
         self.evm_sink.set_max(0, 20)
         self.evm_sink_win = sip.wrapinstance(self.evm_sink.qwidget(), Qt.QWidget)
 
-        self.evm = evm_generic_block(points, window=2048,skip_samples=2408)
+        self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
 
         self.connect(self.src, self.tx, self.pluto)
         self.connect(self.pluto, self.freq_sink)

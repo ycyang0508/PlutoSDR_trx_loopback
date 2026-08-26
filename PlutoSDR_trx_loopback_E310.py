@@ -59,7 +59,6 @@ class evm_generic_block(gr.sync_block):
                 min_idx = np.argmin(dists, axis=1)
                 ref_syms = self.ref[min_idx]
 
-                # Least Squares 擬合的最佳幅度縮放比例
                 scale = np.real(np.sum(rot_x * np.conj(ref_syms))) / (np.sum(np.abs(rot_x)**2) + 1e-12)
                 scaled_x = rot_x * scale
                 errs = scaled_x - ref_syms
@@ -93,7 +92,7 @@ class evm_generic_block(gr.sync_block):
         return n
 
 # ---------------------------------------------------------
-#  PlutoSDR TX/RX Block (原架構保留，更新最佳硬體與縮放參數)
+#  PlutoSDR TX/RX Block
 # ---------------------------------------------------------
 class PlutoIO(gr.sync_block):
     def __init__(self, buf_len, sdr):
@@ -110,7 +109,6 @@ class PlutoIO(gr.sync_block):
 
         self.rx_buf = np.array([], dtype=np.complex64)
 
-        # 清掉 PlutoSDR pipeline 的舊資料
         for _ in range(5):
             _ = self.sdr.rx()
 
@@ -120,14 +118,13 @@ class PlutoIO(gr.sync_block):
         n_in  = len(in_data)
         n_out = len(out_data)
 
-        # TX
-        for i in range(0, n_in, self.buf_len):
-            end = min(i + self.buf_len, n_in)
-            tx_chunk = in_data[i:end]
-            if len(tx_chunk) > 0:
-                self.sdr.tx(tx_chunk)
+       #for i in range(0, n_in, self.buf_len):
+       #    end = min(i + self.buf_len, n_in)
+       #    tx_chunk = in_data[i:end]
+       #    if len(tx_chunk) > 0:
+       #        self.sdr.tx(tx_chunk)
+        self.sdr.tx(in_data)
 
-        # RX
         while len(self.rx_buf) < n_out:
             rx_chunk = self.sdr.rx()
             self.rx_buf = np.concatenate([self.rx_buf, rx_chunk])
@@ -136,8 +133,6 @@ class PlutoIO(gr.sync_block):
         self.rx_buf = self.rx_buf[n_out:]
 
         return n_out
-
-      
 
 class PlutoSDR_txrx_stream(gr.hier_block2):
     def __init__(self, uri="ip:192.168.1.10", samp_rate=1_000_000,
@@ -153,7 +148,6 @@ class PlutoSDR_txrx_stream(gr.hier_block2):
         self.sdr = adi.Pluto(uri)
         self.sdr.sample_rate = int(samp_rate)
 
-        # 啟用 AD9361 晶片內建的正交 (IQ Imbalance) 與 RF DC 追蹤
         try:
             self.sdr.quadrature_tracking_en = True
             self.sdr.rfdc_tracking_en = True
@@ -162,17 +156,16 @@ class PlutoSDR_txrx_stream(gr.hier_block2):
             pass
 
         self.sdr.tx_lo = int(tx_lo)
-        self.sdr.tx_hardwaregain_chan0 = 0    # 調整至最佳線性發射增益
+        self.sdr.tx_hardwaregain_chan0 = 0
         self.sdr.tx_buffer_size = buf_len
         self.sdr.tx_cyclic_buffer = False
 
         self.sdr.rx_lo = int(rx_lo)
         self.sdr.gain_control_mode_chan0 = 'manual'
-        self.sdr.rx_hardwaregain_chan0 = 20   # 最佳接收增益 (提高 SNR 且避免混頻器飽和)
+        self.sdr.rx_hardwaregain_chan0 = 20
         self.sdr.rx_buffer_size = buf_len
         self.sdr.rx_rf_bandwidth = int(samp_rate * 2)
 
-        # 放大 DAC 訊號幅值，提升動態範圍
         self.tx_scale = blocks.multiply_const_cc(10000.0)
         self.rx_scale = blocks.multiply_const_cc(1.0 / 10000.0)
 
@@ -213,7 +206,7 @@ class QPSK_TX_block(gr.hier_block2):
         self.connect(self, self.mapper, self.rrc_tx, self)
 
 # ---------------------------------------------------------
-#  QPSK RX Block (替換為 Gardner TED & 移除會砍掉 DC 帶內訊號的 DC Blocker)
+#  QPSK RX Block（輸出 symbols + bits）
 # ---------------------------------------------------------
 class QPSK_RX_block(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, rolloff=0.35):
@@ -221,7 +214,7 @@ class QPSK_RX_block(gr.hier_block2):
             self,
             "QPSK_RX_block",
             gr.io_signature(1, 1, gr.sizeof_gr_complex),
-            gr.io_signature(1, 1, gr.sizeof_gr_complex),
+            gr.io_signaturev(2, 2, [gr.sizeof_gr_complex, gr.sizeof_char]),
         )
 
         sym_rate = samp_rate // sps
@@ -238,7 +231,6 @@ class QPSK_RX_block(gr.hier_block2):
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
         self.agc = analog.agc2_cc(1e-3, 1e-4, 1.41421356, 1.0)
 
-        # 採用 Gardner 算法進行符號時間同步 (對於 QPSK 脈衝成形解調比 M&M 更穩定)
         self.clock_sync = digital.symbol_sync_cc(
             digital.TED_GARDNER,
             sps,
@@ -251,14 +243,19 @@ class QPSK_RX_block(gr.hier_block2):
             digital.IR_MMSE_8TAP
         )
 
-        # 優化相位鎖相環 (Costas Loop) 增益
         self.costas = digital.costas_loop_cc(0.0003, 4, False)
         self.copy = blocks.copy(gr.sizeof_gr_complex)
 
-        # 將 RRC Filter 移至 AGC 前面，獲得最佳匹配濾波效果
+        self.const = digital.constellation_qpsk().base()
+        self.decoder = digital.constellation_decoder_cb(self.const)
+        self.sym2bit = digital.map_bb([0, 1, 3, 2])
+        self.unpack = blocks.unpack_k_bits_bb(2)
+
         self.connect(self, self.rrc_rx, self.agc,
                      self.clock_sync, self.costas, self.copy)
-        self.connect(self.copy, self)
+
+        self.connect(self.copy, (self, 0))
+        self.connect(self.costas, self.decoder, self.sym2bit, self.unpack, (self, 1))
 
 # ---------------------------------------------------------
 #  主程式
@@ -291,13 +288,14 @@ class qpsk_cable_demo(gr.top_block):
         )
 
         self.freq_sink = qtgui.freq_sink_c(
-            2048,
+            8192,
             fft.window.WIN_HAMMING,
             0,
             samp_rate,
             "Rx Spectrum (1MHz)"
         )
         self.freq_win = sip.wrapinstance(self.freq_sink.qwidget(), Qt.QWidget)
+        self.freq_sink.set_fft_average(0.5)
 
         self.const_sink = qtgui.const_sink_c(
             1024,
@@ -307,6 +305,9 @@ class qpsk_cable_demo(gr.top_block):
         self.const_sink.set_x_axis(-2.0, 2.0)
         self.const_sink.set_y_axis(-2.0, 2.0)
         self.const_win = sip.wrapinstance(self.const_sink.qwidget(), Qt.QWidget)
+
+
+        self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
 
         self.evm_sink = qtgui.number_sink(
             gr.sizeof_float,
@@ -320,14 +321,30 @@ class qpsk_cable_demo(gr.top_block):
         self.evm_sink.set_min(0, -20)
         self.evm_sink.set_max(0, 20)
         self.evm_sink_win = sip.wrapinstance(self.evm_sink.qwidget(), Qt.QWidget)
+               
 
-        self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
+        # 新增：bit output 的空 sink
+        self.bit_sink = blocks.null_sink(gr.sizeof_char)
 
+        # TX path
         self.connect(self.src, self.tx, self.pluto)
+
+        # Spectrum
         self.connect(self.pluto, self.freq_sink)
+
+        # RX symbols + bits
         self.connect(self.pluto, self.rx)
-        self.connect(self.rx, self.const_sink)
-        self.connect(self.rx, self.evm, self.evm_sink)
+
+        # constellation
+        self.connect((self.rx, 0), (self.const_sink, 0))
+
+        # EVM
+        self.connect((self.rx, 0), self.evm)
+        self.connect(self.evm, self.evm_sink)
+
+        # 新增：bit output 接到 null sink
+        self.connect((self.rx, 1), self.bit_sink)
+
 
 def run_demo():
     app = Qt.QApplication(sys.argv)

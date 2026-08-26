@@ -166,11 +166,23 @@ class PlutoSDR_txrx_stream(gr.hier_block2):
         self.sdr.rx_buffer_size = buf_len
         self.sdr.rx_rf_bandwidth = int(samp_rate * 2)
 
+        # scaling
         self.tx_scale = blocks.multiply_const_cc(10000.0)
         self.rx_scale = blocks.multiply_const_cc(1.0 / 10000.0)
 
+        # throttle blocks
+        self.tx_throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
+        self.rx_throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
+
+        # Pluto IO
         self.pluto_io = PlutoIO(buf_len, self.sdr)
-        self.connect(self, self.tx_scale, self.pluto_io, self.rx_scale, self)
+
+        # TX path: input → scale → throttle → Pluto
+        self.connect(self, self.tx_throttle, self.tx_scale, self.pluto_io)
+
+        # RX path: Pluto → throttle → scale → output
+        self.connect(self.pluto_io,  self.rx_scale, self.rx_throttle,self)
+
 
 # ---------------------------------------------------------
 #  QPSK TX Block
@@ -295,7 +307,7 @@ class qpsk_cable_demo(gr.top_block):
             "Rx Spectrum (1MHz)"
         )
         self.freq_win = sip.wrapinstance(self.freq_sink.qwidget(), Qt.QWidget)
-        self.freq_sink.set_fft_average(0.5)
+        self.freq_sink.set_fft_average(0.3)
 
         self.const_sink = qtgui.const_sink_c(
             1024,

@@ -12,6 +12,7 @@ from rf_trx import *
 from qpsk_symbol_dsp import *
 from QAM16_symbol_dsp import *
 from QAM64_symbol_dsp import *
+from QAM256_symbol_dsp import *
 # ---------------------------------------------------------
 #  主程式
 # ---------------------------------------------------------
@@ -27,8 +28,10 @@ class qpsk_cable_demo(gr.top_block):
         #self.sym_dsp_rx = QPSK_RX_block(sps=sps, samp_rate=samp_rate)
         #self.sym_dsp_tx = QAM16_TX_block(sps=sps, samp_rate=samp_rate)
         #self.sym_dsp_rx = QAM16_RX_block(sps=sps, samp_rate=samp_rate)
-        self.sym_dsp_tx = QAM64_TX_block(sps=sps, samp_rate=samp_rate)
-        self.sym_dsp_rx = QAM64_RX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_tx = QAM64_TX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_rx = QAM64_RX_block(sps=sps, samp_rate=samp_rate)
+        self.sym_dsp_tx = QAM256_TX_block(sps=sps, samp_rate=samp_rate)
+        self.sym_dsp_rx = QAM256_RX_block(sps=sps, samp_rate=samp_rate)
 
         n_symbols = 200000
         constellation_point = self.sym_dsp_rx.constellation_point
@@ -55,7 +58,7 @@ class qpsk_cable_demo(gr.top_block):
 
         self.const_sink = qtgui.const_sink_c(
             1024,
-            "Cable Loopback 64QAM (1MHz)",
+            "Cable Loopback 256QAM (1MHz)",
             1
         )
         self.const_sink.set_x_axis(-2.0, 2.0)

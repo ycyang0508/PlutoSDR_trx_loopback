@@ -25,6 +25,7 @@
     <Compile Include="PlutoSDR_trx_loopback_E310.py" />
     <Compile Include="pluto_loopback_demo.py" />
     <Compile Include="QAM16_symbol_dsp.py" />
+    <Compile Include="QAM256_symbol_dsp.py" />
     <Compile Include="QAM64_symbol_dsp.py" />
     <Compile Include="qpsk_symbol_dsp.py" />
     <Compile Include="radio_eval.py" />

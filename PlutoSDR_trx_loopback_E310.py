@@ -22,9 +22,7 @@ class qpsk_cable_demo(gr.top_block):
         sps = 4
         buf_len = 16384
 
-        const = digital.constellation_qpsk().base()
-        raw_pts = np.array(const.points(), dtype=np.complex64)
-        points = raw_pts / np.abs(raw_pts[0])
+        
 
         n_symbols = 200000
         rnd = np.random.randint(0, 4, n_symbols).tolist()
@@ -60,7 +58,9 @@ class qpsk_cable_demo(gr.top_block):
         self.const_sink.set_y_axis(-2.0, 2.0)
         self.const_win = sip.wrapinstance(self.const_sink.qwidget(), Qt.QWidget)
 
-
+        const = self.qpsk_sym_rx.const
+        raw_pts = np.array(const.points(), dtype=np.complex64)
+        points = raw_pts / np.abs(raw_pts[0])
         self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
 
         self.evm_sink = qtgui.number_sink(

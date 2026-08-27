@@ -24,6 +24,9 @@
     <Compile Include="custom_blocks.py" />
     <Compile Include="PlutoSDR_trx_loopback_E310.py" />
     <Compile Include="pluto_loopback_demo.py" />
+    <Compile Include="qpsk_symbol_dsp.py" />
+    <Compile Include="radio_eval.py" />
+    <Compile Include="rf_trx.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

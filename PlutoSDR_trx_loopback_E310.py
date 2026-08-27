@@ -10,7 +10,8 @@ from collections import deque
 from radio_eval import *
 from rf_trx import *
 from qpsk_symbol_dsp import *
-
+from QAM16_symbol_dsp import *
+from QAM64_symbol_dsp import *
 # ---------------------------------------------------------
 #  主程式
 # ---------------------------------------------------------
@@ -21,15 +22,18 @@ class qpsk_cable_demo(gr.top_block):
         samp_rate = 1_000_000
         sps = 4
         buf_len = 16384
-
-        
+              
+        #self.sym_dsp_tx = QPSK_TX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_rx = QPSK_RX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_tx = QAM16_TX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_rx = QAM16_RX_block(sps=sps, samp_rate=samp_rate)
+        self.sym_dsp_tx = QAM64_TX_block(sps=sps, samp_rate=samp_rate)
+        self.sym_dsp_rx = QAM64_RX_block(sps=sps, samp_rate=samp_rate)
 
         n_symbols = 200000
-        rnd = np.random.randint(0, 4, n_symbols).tolist()
+        constellation_point = self.sym_dsp_rx.constellation_point
+        rnd = np.random.randint(0, constellation_point, n_symbols).tolist()
         self.src = blocks.vector_source_b(rnd, repeat=True)
-
-        self.qpsk_sym_tx = QPSK_TX_block(sps=sps, samp_rate=samp_rate)
-        self.qpsk_sym_rx = QPSK_RX_block(sps=sps, samp_rate=samp_rate)
 
         self.pluto = PlutoSDR_txrx_stream(
             uri="ip:192.168.1.10",
@@ -51,14 +55,14 @@ class qpsk_cable_demo(gr.top_block):
 
         self.const_sink = qtgui.const_sink_c(
             1024,
-            "Cable Loopback QPSK (1MHz)",
+            "Cable Loopback 64QAM (1MHz)",
             1
         )
         self.const_sink.set_x_axis(-2.0, 2.0)
         self.const_sink.set_y_axis(-2.0, 2.0)
         self.const_win = sip.wrapinstance(self.const_sink.qwidget(), Qt.QWidget)
 
-        const = self.qpsk_sym_rx.const
+        const = self.sym_dsp_rx.const
         raw_pts = np.array(const.points(), dtype=np.complex64)
         points = raw_pts / np.abs(raw_pts[0])
         self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
@@ -81,22 +85,22 @@ class qpsk_cable_demo(gr.top_block):
         self.bit_sink = blocks.null_sink(gr.sizeof_char)
 
         # TX path
-        self.connect(self.src, self.qpsk_sym_tx, self.pluto)
+        self.connect(self.src, self.sym_dsp_tx, self.pluto)
 
         # Spectrum
         self.connect(self.pluto, self.freq_sink)
 
         # RX symbols + bits
-        self.connect(self.pluto, self.qpsk_sym_rx)        
+        self.connect(self.pluto, self.sym_dsp_rx)        
 
         # constellation
-        self.connect((self.qpsk_sym_rx, 0), (self.const_sink, 0))
+        self.connect((self.sym_dsp_rx, 0), (self.const_sink, 0))
 
         # EVM
-        self.connect((self.qpsk_sym_rx, 0), self.evm,self.evm_sink)        
+        self.connect((self.sym_dsp_rx, 0), self.evm,self.evm_sink)        
 
         # 新增：bit output 接到 null sink
-        self.connect((self.qpsk_sym_rx, 1), self.bit_sink)
+        self.connect((self.sym_dsp_rx, 1), self.bit_sink)
 
 
 def run_demo():

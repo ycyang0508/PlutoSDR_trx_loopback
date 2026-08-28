@@ -4,7 +4,8 @@ import numpy as np
 import adi
 from PyQt5 import Qt
 import sip
-from gnuradio import gr, blocks, analog, digital, qtgui, filter, fft
+import time
+from gnuradio import gr, blocks, analog, digital, qtgui, filter, fft,zeromq
 from custom_blocks import *
 from collections import deque
 from radio_eval import *
@@ -105,7 +106,6 @@ class qpsk_cable_demo(gr.top_block):
         # 新增：bit output 接到 null sink
         self.connect((self.sym_dsp_rx, 1), self.bit_sink)
 
-
 def run_demo():
     app = Qt.QApplication(sys.argv)
     tb = qpsk_cable_demo()
@@ -122,5 +122,98 @@ def run_demo():
     tb.stop()
     tb.wait()
 
+class zeroMQ_PlutoSDR_demo1(gr.top_block):
+    def __init__(self):
+        gr.top_block.__init__(self)
+
+        uri="ip:192.168.1.10"  # 保留介面相容性（內部不使用）
+        samp_rate=1_000_000
+        tx_lo=915e6
+        rx_lo=915e6
+        buf_len=32768
+        zmq_rx_addr="tcp://127.0.0.1:5555"
+        zmq_tx_addr="tcp://127.0.0.1:5556"
+
+        # Pluto TX/RX
+        #self.pluto = PlutoSDR_zmq_txrx_stream()
+
+        # 1. 實例化內部 Buffer Loopback 核心
+        self.loopback_core = InternalBufferLoopback(buf_len=buf_len)
+
+        # 2. Rate Control (Throttle 確保讀寫速度符合 sample_rate)
+        self.throttle = blocks.throttle(
+            gr.sizeof_gr_complex, samp_rate, True
+        )
+
+        # 3. ZeroMQ 端點配置
+        # TX: SUB Source 接收 Python PUB (bind=False)
+        self.zmq_tx_source = zeromq.pull_source(gr.sizeof_gr_complex,  1, zmq_tx_addr, 2048, False, -1, False )
+
+        # RX: PUSH Sink 傳送給 Python PULL (bind=True)
+        self.zmq_rx_sink = zeromq.push_sink(
+            gr.sizeof_gr_complex, 1, zmq_rx_addr, 2048, False, -1, True
+        )
+
+        # 4. 拓撲連線：ZMQ TX Source -> Loopback Buffer -> Throttle -> ZMQ RX Sink
+        self.connect(self.zmq_tx_source, self.loopback_core)
+        self.connect(self.loopback_core, self.throttle, self.zmq_rx_sink)
+
+
+
+class zeroMQ_PlutoSDR_demo(gr.top_block):
+    def __init__(self):
+        gr.top_block.__init__(self, "zeroMQ_PlutoSDR_demo")
+
+        uri = "ip:192.168.1.10"
+        samp_rate = 1_000_000
+        tx_lo = 915e6
+        rx_lo = 915e6
+        buf_len = 32768
+        zmq_rx_addr = "tcp://127.0.0.1:5555"
+        zmq_tx_addr = "tcp://127.0.0.1:5556"
+
+        # 1. 實例化純粹處理硬體 I/O 的 Pluto Stream Block
+        self.pluto = PlutoSDR_txrx_stream(
+            uri=uri,
+            samp_rate=samp_rate,
+            tx_lo=tx_lo,
+            rx_lo=rx_lo,
+            buf_len=buf_len,
+        )
+
+        # 2. Rate Control (Throttle 確保讀寫速度與 Sample Rate 對齊)
+        self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
+
+        # 3. ZeroMQ 端點配置 (直接置於 Top Block)
+        # TX: PULL Source 接收來自 Python PUSH 的資料 (bind=False)
+        self.zmq_tx_source = zeromq.pull_source(
+            gr.sizeof_gr_complex, 1, zmq_tx_addr, buf_len, False, -1, False
+        )
+
+        # RX: PUSH Sink 傳送資料給 Python PULL (bind=True)
+        self.zmq_rx_sink = zeromq.push_sink(
+            gr.sizeof_gr_complex, 1, zmq_rx_addr, buf_len, False, -1, True
+        )
+
+        # 4. 拓撲連線：ZMQ TX Source -> Pluto TX | Pluto RX -> Throttle -> ZMQ RX Sink
+        # 註：若 PlutoSDR_txrx_stream 內部有分別處理 TX/RX 的 pad/in/out，依對應端口連接：
+        self.connect(self.zmq_tx_source, self.pluto)
+        self.connect(self.pluto, self.throttle, self.zmq_rx_sink)
+
+
+def run_zeroMQ():
+    tb = zeroMQ_PlutoSDR_demo()
+    tb.start()
+    try:
+        print("Flowgraph running... Press Ctrl-C to stop.")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Stopping flowgraph...")
+        tb.stop()
+        tb.wait()
+
+
 if __name__ == "__main__":
-    run_demo()
+    #run_demo()
+    run_zeroMQ()

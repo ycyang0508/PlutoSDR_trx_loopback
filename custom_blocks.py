@@ -56,3 +56,44 @@ class FakePlutoSDR(gr.sync_block):
         self.read_idx = (self.read_idx + out_n) % self.fifo_size
 
         return out_n
+
+
+class InternalBufferLoopback(gr.sync_block):
+
+    def __init__(self, buf_len=32768):
+        gr.sync_block.__init__(
+            self,
+            name="InternalBufferLoopback",
+            in_sig=[np.complex64],   # 接收來自 ZMQ TX Source 的資料
+            out_sig=[np.complex64],  # 輸出給 ZMQ RX Sink 的資料
+        )
+        self.buf_len = buf_len
+        self.buffer = np.array([], dtype=np.complex64)
+        self.tx_count = 0
+        self.rx_count = 0
+
+    def work(self, input_items, output_items):
+        in_data = input_items[0]
+        out_data = output_items[0]
+
+        n_in = len(in_data)
+        n_out = len(out_data)
+
+        # 1. 將輸入資料寫入內部 Buffer
+        print(f"Tx write {n_in}")
+        if n_in > 0:           
+            self.buffer = np.concatenate((self.buffer, in_data))
+            self.tx_count += n_in
+
+        # 2. 從內部 Buffer 讀取資料寫到 Output (RX)
+        n_to_write = min(n_out, len(self.buffer))
+
+        if n_to_write > 0:
+            out_data[:n_to_write] = self.buffer[:n_to_write]
+            self.buffer = self.buffer[n_to_write:]
+            self.rx_count += n_to_write
+            return n_to_write
+        else:
+            # 如果 Buffer 空了，填充 0 避免 GRC 管道斷流
+            out_data[:n_out] = 0
+            return n_out

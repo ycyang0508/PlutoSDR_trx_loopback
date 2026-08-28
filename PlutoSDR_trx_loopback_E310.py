@@ -45,8 +45,7 @@ class qpsk_cable_demo(gr.top_block):
             tx_lo=915e6,
             rx_lo=915e6,
             buf_len=buf_len
-        )
-
+        )        
         self.freq_sink = qtgui.freq_sink_c(
             8192,
             fft.window.WIN_HAMMING,
@@ -158,8 +157,6 @@ class zeroMQ_direct_loopback(gr.top_block):
         self.connect(self.zmq_tx_source, self.loopback_core)
         self.connect(self.loopback_core, self.throttle, self.zmq_rx_sink)
 
-
-
 class zeroMQ_PlutoSDR_demo(gr.top_block):
     def __init__(self):
         gr.top_block.__init__(self, "zeroMQ_PlutoSDR_demo")
@@ -200,7 +197,6 @@ class zeroMQ_PlutoSDR_demo(gr.top_block):
         self.connect(self.zmq_tx_source, self.pluto)
         self.connect(self.pluto, self.throttle, self.zmq_rx_sink)
 
-
 def run_zeroMQ():
     tb = zeroMQ_PlutoSDR_demo()
     tb.start()
@@ -213,7 +209,6 @@ def run_zeroMQ():
         tb.stop()
         tb.wait()
 
-
 if __name__ == "__main__":
-    #run_demo()
-    run_zeroMQ()
+    run_demo()
+    #run_zeroMQ()

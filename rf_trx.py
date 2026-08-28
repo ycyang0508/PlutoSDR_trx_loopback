@@ -6,42 +6,88 @@ import sip
 from gnuradio import gr, blocks
 
 
-
-
-# ---------------------------------------------------------
-#  PlutoSDR TX/RX Block
-# ---------------------------------------------------------
-class PlutoIO(gr.sync_block):
-    def __init__(self, buf_len, sdr):
+# =========================================================
+#  1. PlutoSDR 獨立 TX Block
+# =========================================================
+class PlutoTX(gr.sync_block):
+    def __init__(self, uri="ip:192.168.1.10", samp_rate=1_000_000, 
+                 tx_lo=915e6, tx_gain=0, buf_len=32768, sdr=None):
         gr.sync_block.__init__(
             self,
-            name="pluto_io",
+            name="pluto_tx",
             in_sig=[np.complex64],
+            out_sig=[]  # TX 是 Sink Block
+        )
+        self.buf_len = buf_len
+        self.sdr = sdr if sdr else adi.Pluto(uri)
+        
+        self.sdr.sample_rate = int(samp_rate)
+        self.sdr.tx_lo = int(tx_lo)
+        self.sdr.tx_hardwaregain_chan0 = int(tx_gain)
+        self.sdr.tx_buffer_size = buf_len
+        self.sdr.tx_cyclic_buffer = False
+
+        # 初始化 TX 緩衝區 (FIFO)
+        self.tx_buf = np.array([], dtype=np.complex64)
+
+    def work(self, input_items, output_items):
+        in_data = input_items[0]
+        
+        # 1. 將 GNU Radio 上游進來的數據 append 到內部 FIFO
+        if len(in_data) > 0:
+            self.tx_buf = np.concatenate([self.tx_buf, in_data])
+
+        # 2. 只要 FIFO 內的數據大於等於一個標準硬體 Buffer，就切割並送出
+        while len(self.tx_buf) >= self.buf_len:
+            tx_chunk = self.tx_buf[:self.buf_len]
+            self.sdr.tx(tx_chunk)                 # 永遠傳送固定長度 (buf_len)
+            self.tx_buf = self.tx_buf[self.buf_len:] # 移除已發送的數據
+
+        # 3. 告知 GNU Radio 已消耗完本輪輸入的所有採樣點
+        return len(in_data)
+
+
+# =========================================================
+#  2. PlutoSDR 獨立 RX Block
+# =========================================================
+class PlutoRX(gr.sync_block):
+    def __init__(self, uri="ip:192.168.1.10", samp_rate=1_000_000, 
+                 rx_lo=915e6, rx_gain=20, buf_len=32768, sdr=None):
+        gr.sync_block.__init__(
+            self,
+            name="pluto_rx",
+            in_sig=[],  # RX 是 Source 節點，沒有輸入
             out_sig=[np.complex64]
         )
         self.buf_len = buf_len
-        self.sdr = sdr
-        self.set_output_multiple(buf_len)
+        # 若外部沒傳入共享 sdr，則自行建立實例
+        self.sdr = sdr if sdr else adi.Pluto(uri)
+
+        self.sdr.sample_rate = int(samp_rate)
+        self.sdr.rx_lo = int(rx_lo)
+        self.sdr.gain_control_mode_chan0 = 'manual'
+        self.sdr.rx_hardwaregain_chan0 = int(rx_gain)
         self.sdr.rx_buffer_size = buf_len
+        self.sdr.rx_rf_bandwidth = int(samp_rate * 2)
+
+        try:
+            self.sdr.quadrature_tracking_en = True
+            self.sdr.rfdc_tracking_en = True
+            self.sdr.bbdc_tracking_en = False
+        except AttributeError:
+            pass
 
         self.rx_buf = np.array([], dtype=np.complex64)
 
+        # 預先拋棄前幾幀無效資料（Flush Hardware Buffer）
         for _ in range(5):
             _ = self.sdr.rx()
 
     def work(self, input_items, output_items):
-        in_data = input_items[0]
         out_data = output_items[0]
-        n_in  = len(in_data)
         n_out = len(out_data)
 
-       #for i in range(0, n_in, self.buf_len):
-       #    end = min(i + self.buf_len, n_in)
-       #    tx_chunk = in_data[i:end]
-       #    if len(tx_chunk) > 0:
-       #        self.sdr.tx(tx_chunk)
-        self.sdr.tx(in_data)
-
+        # 持續拉取硬體數據，直到滿足 output_items 的長度需求
         while len(self.rx_buf) < n_out:
             rx_chunk = self.sdr.rx()
             self.rx_buf = np.concatenate([self.rx_buf, rx_chunk])
@@ -51,6 +97,9 @@ class PlutoIO(gr.sync_block):
 
         return n_out
 
+# ---------------------------------------------------------
+#  PlutoSDR TX/RX Block
+# ---------------------------------------------------------
 class PlutoSDR_txrx_stream(gr.hier_block2):
     def __init__(self, uri="ip:192.168.1.10", samp_rate=1_000_000,
                  tx_lo=915e6, rx_lo=915e6, buf_len=32768):
@@ -92,13 +141,15 @@ class PlutoSDR_txrx_stream(gr.hier_block2):
         self.rx_throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
         # Pluto IO
-        self.pluto_io = PlutoIO(buf_len, self.sdr)
+        #self.pluto_io = PlutoIO_rx(buf_len, self.sdr)
+        self.sdr_tx = PlutoTX(uri="ip:192.168.1.10",samp_rate=samp_rate,tx_lo=tx_lo,buf_len=buf_len,sdr=self.sdr)
+        self.sdr_rx = PlutoRX(uri="ip:192.168.1.10",samp_rate=samp_rate,rx_lo=tx_lo,buf_len=buf_len,sdr=self.sdr)
 
         # TX path: input → scale → throttle → Pluto
-        self.connect(self, self.tx_throttle, self.tx_scale, self.pluto_io)
+        self.connect(self, self.tx_throttle, self.tx_scale, self.sdr_tx)
 
         # RX path: Pluto → throttle → scale → output
-        self.connect(self.pluto_io,  self.rx_scale, self.rx_throttle,self)
+        self.connect(self.sdr_rx,  self.rx_scale, self.rx_throttle,self)
 
 
 # -------------------------------------------------------------------

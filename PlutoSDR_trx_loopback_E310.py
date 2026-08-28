@@ -122,7 +122,7 @@ def run_demo():
     tb.stop()
     tb.wait()
 
-class zeroMQ_PlutoSDR_demo1(gr.top_block):
+class zeroMQ_direct_loopback(gr.top_block):
     def __init__(self):
         gr.top_block.__init__(self)
 

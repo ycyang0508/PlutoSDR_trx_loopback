@@ -14,9 +14,13 @@ from qpsk_symbol_dsp import *
 from QAM16_symbol_dsp import *
 from QAM64_symbol_dsp import *
 from QAM256_symbol_dsp import *
+
+
 # ---------------------------------------------------------
 #  主程式
 # ---------------------------------------------------------
+RF_CH_MODEL = True
+
 class qpsk_cable_demo(gr.top_block):
     def __init__(self):
         gr.top_block.__init__(self)
@@ -39,13 +43,24 @@ class qpsk_cable_demo(gr.top_block):
         rnd = np.random.randint(0, constellation_point, n_symbols).tolist()
         self.src = blocks.vector_source_b(rnd, repeat=True)
 
-        self.pluto = PlutoSDR_txrx_stream(
-            uri="ip:192.168.1.10",
-            samp_rate=samp_rate,
-            tx_lo=915e6,
-            rx_lo=915e6,
-            buf_len=buf_len
-        )        
+        if RF_CH_MODEL:
+            self.pluto = channel_model_txrx(
+                                        samp_rate=samp_rate,
+                                        noise_voltage=0.002,
+                                        freq_offset=20,
+                                        multipath_taps=[1.0, 0.3+0.1j, 0.1]
+                                       )    
+        else:
+            self.pluto = PlutoSDR_txrx_stream(
+                uri="ip:192.168.1.10",
+                samp_rate=samp_rate,
+                tx_lo=915e6,
+                rx_lo=915e6,
+                buf_len=buf_len
+            )   
+        
+        
+
         self.freq_sink = qtgui.freq_sink_c(
             8192,
             fft.window.WIN_HAMMING,
@@ -210,5 +225,6 @@ def run_zeroMQ():
         tb.wait()
 
 if __name__ == "__main__":
+    #print([attr for attr in dir(digital) if attr.startswith("TED_")])
     run_demo()
     #run_zeroMQ()

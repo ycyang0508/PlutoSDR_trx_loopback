@@ -44,7 +44,7 @@ class QAM256_TX_block(gr.hier_block2):
 
 
 # ---------------------------------------------------------
-#  256QAM RX Block (Char Output, EVM ~5.3%)
+#  256QAM RX Block (Char Output, 支援抗大 CFO & 相位鎖定)
 # ---------------------------------------------------------
 class QAM256_RX_block(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, rolloff=0.35):
@@ -57,54 +57,51 @@ class QAM256_RX_block(gr.hier_block2):
 
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
+        nfilters = 32
         self.constellation_point = 256
 
-        rrc_taps = filter.firdes.root_raised_cosine(
-            gain=1.0,
-            sampling_freq=samp_rate,
-            symbol_rate=sym_rate,
-            alpha=rolloff,
-            ntaps=ntaps
-        )
-
-        self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
-        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
-
+        # 1. 建立標準 256QAM 星座圖物件
         self.const = digital.qam_constellation(256).base()
 
-        # Symbol Synchronization
+        # 2. 自動增益控制 (AGC)
+        self.agc = analog.agc2_cc(1e-2, 1e-3, 1.0, 1.0)
+
+        # 3. Polyphase RRC Filter Taps
+        rrc_taps = filter.firdes.root_raised_cosine(
+            gain=nfilters,  # Polyphase 增益補償
+            sampling_freq=samp_rate * nfilters,
+            symbol_rate=sym_rate,
+            alpha=rolloff,
+            ntaps=ntaps * nfilters
+        )
+
+        # 4. Symbol Synchronization (1 SPS 重採樣 & 時脈同步)
         self.clock_sync = digital.symbol_sync_cc(
-            digital.TED_GARDNER,
-            sps,
-            0.0005,
-            1.0,
-            1.0,
-            1.5,
-            1,
-            self.const,
-            digital.IR_MMSE_8TAP
+            detector_type=digital.TED_MOD_MUELLER_AND_MULLER,
+            sps=sps,
+            loop_bw=0.0001,                 # 小頻寬防止採樣點晃動
+            damping_factor=0.707,
+            ted_gain=1.0,
+            max_deviation=1.0,
+            osps=1,
+            slicer=self.const,              # Decision-Directed 採樣
+            interp_type=digital.IR_PFB_MF,
+            n_filters=nfilters,
+            taps=rrc_taps
         )
 
-        # CMA Equalizer
-        cma_alg = digital.adaptive_algorithm_cma(self.const, 0.00004, 1.0).base()
-        self.equalizer = digital.linear_equalizer(
-            15,
-            sps,
-            cma_alg,
-            True
-        )
-
-        # Costas Loop
-        self.costas = digital.costas_loop_cc(0.00008, 4, False)
+        # 5. 精密單級 Costas Loop (載波鎖頻與鎖相)
+        # 【核心修正】：移除會扯爆星座圖的 0.005 粗鎖環路
+        # 設定為 0.0001 的超低 Loop BW，既能抓住殘留頻偏，又能完全凝固 256QAM 相位
+        self.costas = digital.costas_loop_cc(0.0001, 4, False)
+        
         self.copy = blocks.copy(gr.sizeof_gr_complex)
 
-        # 解碼器與 8-bit Unpack (剛好對應 1 Byte/Char)
+        # 6. 解碼與 Unpack
         self.decoder = digital.constellation_decoder_cb(self.const)
         self.unpack = blocks.unpack_k_bits_bb(8)
 
-        # 訊號串接
-        self.connect(self, self.rrc_rx, self.agc,
-                     self.clock_sync, self.equalizer, self.costas, self.copy)
-
+        # 7. 乾淨訊號鏈串接: AGC -> Symbol Sync -> Costas Loop
+        self.connect(self, self.agc, self.clock_sync, self.costas, self.copy)
         self.connect(self.copy, (self, 0))
         self.connect(self.costas, self.decoder, self.unpack, (self, 1))

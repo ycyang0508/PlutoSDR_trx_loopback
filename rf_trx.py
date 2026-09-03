@@ -3,7 +3,7 @@ import sys
 import numpy as np
 import adi
 import sip
-from gnuradio import gr, blocks
+from gnuradio import gr, blocks,analog, filter, zeromq
 
 
 # =========================================================
@@ -195,3 +195,73 @@ class PlutoSDR_zmq_txrx_stream(gr.hier_block2):
         # 4. 拓撲連線：ZMQ TX Source -> Loopback Buffer -> Throttle -> ZMQ RX Sink
         self.connect(self.zmq_tx_source, self.loopback_core)
         self.connect(self.loopback_core, self.throttle, self.zmq_rx_sink)
+
+# ---------------------------------------------------------
+#  Channel Model TX/RX Block (no hardware)
+# ---------------------------------------------------------
+class channel_model_txrx(gr.hier_block2):
+    def __init__(self,
+                 samp_rate=1_000_000,
+                 noise_voltage=0.01,
+                 freq_offset=0.0,
+                 multipath_taps=None):
+
+        gr.hier_block2.__init__(
+            self,
+            "channel_model_txrx",
+            gr.io_signature(1, 1, gr.sizeof_gr_complex),
+            gr.io_signature(1, 1, gr.sizeof_gr_complex),
+        )
+
+        # -------------------------
+        # TX path (identity)
+        # -------------------------
+        self.tx_path = blocks.multiply_const_cc(1.0)
+
+        # -------------------------
+        # Channel model
+        # -------------------------
+        # 1. AWGN
+        self.noise = blocks.add_cc()
+        self.noise_src = analog.noise_source_c(
+            analog.GR_GAUSSIAN,
+            noise_voltage,
+            0
+        )
+
+        # 2. Frequency offset
+        self.freq_offset = blocks.multiply_cc()
+        self.freq_src = analog.sig_source_c(
+            samp_rate,
+            analog.GR_COS_WAVE,
+            freq_offset,
+            1.0,
+            0.0
+        )
+
+        # 3. Multipath fading (FIR)
+        if multipath_taps is None:
+            multipath_taps = [1.0]  # no multipath
+
+        self.multipath = filter.fir_filter_ccc(1, multipath_taps)
+
+        # -------------------------
+        # RX path (identity)
+        # -------------------------
+        self.rx_path = blocks.multiply_const_cc(1.0)
+
+        # -------------------------
+        # Connect TX → Channel → RX
+        # -------------------------
+        # TX
+        self.connect(self, self.tx_path)
+
+        # Channel: TX → multipath → freq_offset → noise → RX
+        self.connect(self.tx_path, self.multipath)
+        self.connect(self.multipath, self.freq_offset)
+        self.connect(self.freq_src, (self.freq_offset, 1))
+        self.connect(self.freq_offset, (self.noise, 0))
+        self.connect(self.noise_src, (self.noise, 1))
+
+        # RX
+        self.connect(self.noise, self.rx_path, self)

@@ -114,7 +114,7 @@ class tx_block(gr.hier_block2):
 
     samp_rate = 100000
     sym_rate = samp_rate // sps
-    ntaps = 11 * sps
+    ntaps = 15 * sps + 1
 
     def bytes_to_qpsk_symbols(bl):
       syms = []
@@ -165,7 +165,7 @@ class rx_block(gr.hier_block2):
 
     samp_rate = 100000
     sym_rate = samp_rate // sps
-    ntaps = 11 * sps
+    ntaps = 15 * sps + 1
 
     rrc = firdes.root_raised_cosine(1, samp_rate, sym_rate, alpha, ntaps)
 

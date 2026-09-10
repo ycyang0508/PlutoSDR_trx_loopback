@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Full QPSK demo:
-- mux TX (preamble + header(payload_len) + payload + CRC)
+Full QPSK demo (Dynamic Packet Version):
+- TX: Dynamic Packet Generator (Variable payload len, variable payload content, Sequence Number in Header)
 - channel_model
-- RX: symbol_sync -> AGC -> Costas -> corr_est_cc -> header strip (remove preamble+header,
-       apply coarse phase & ambiguity correction to payload) -> constellation_decoder -> payload parser (CRC check)
+- RX: symbol_sync -> AGC -> Costas -> corr_est_cc -> header strip -> constellation_decoder -> payload parser (CRC check)
 - GUI constellation tap (after Costas)
 """
 import sys
+import time
 from gnuradio import analog
 from gnuradio import blocks
 from gnuradio import digital
@@ -37,7 +37,7 @@ def crc16_ibm(data_bytes):
     return crc & 0xFFFF
 
 # ============================================================
-# 1. Constellation
+# 1. Constellation & Symbols Setup
 # ============================================================
 QPSK_CONST = digital.constellation_qpsk().base()
 QPSK_POINTS = QPSK_CONST.points()
@@ -50,11 +50,92 @@ def barker_to_qpsk_symbols(barker_list):
 
 QPSK_PREAMBLE_SYMBOLS = barker_to_qpsk_symbols(BARKER_26_BITS)
 
+def bytes_to_symidx(bl):
+    """ Helper: bytes list -> QPSK symbol indices (0..3) """
+    out = []
+    for b in bl:
+        for shift in (6, 4, 2, 0):
+            out.append((b >> shift) & 0x03)
+    return out
+
 # ============================================================
-# 2. TX Block (mux version, payload + CRC)
+# 2. Dynamic TX Packet Source Block
 # ============================================================
+class dynamic_packet_generator(gr.sync_block):
+    """
+    動態 Packet 產生器 Block：
+    每個封包包含：
+    1. Dummy symbols (64 個)
+    2. Preamble (26 個 QPSK 符號)
+    3. Header (4 Bytes: [Payload Len, Seq Num, 0xAA, 0xCC])
+    4. Payload (隨機長度 8~32 Bytes, 隨機內容) + CRC16 (2 Bytes)
+    5. Zero Padding (64 個)
+    """
+    def __init__(self, min_payload_len=8, max_payload_len=32):
+        gr.sync_block.__init__(
+            self,
+            name="dynamic_packet_generator",
+            in_sig=None,
+            out_sig=[np.complex64]
+        )
+        self.min_len = min_payload_len
+        self.max_len = max_payload_len
+        self.seq_num = 0
+
+        self.dummy_syms = barker_to_qpsk_symbols([1, -1] * 32)
+        self.preamble_syms = QPSK_PREAMBLE_SYMBOLS
+        self.zeros_syms = [0+0j] * 64
+
+        self.buffer = np.array([], dtype=np.complex64)
+
+    def _generate_next_packet(self):
+        # 1. 動態決定長度與內容
+        payload_len = np.random.randint(self.min_len, self.max_len + 1)
+        payload_bytes = np.random.randint(0, 256, payload_len, dtype=np.uint8).tolist()
+        
+        # 2. Header 包含: [Payload Len, Seq Num, 0xAA, 0xCC]
+        header_bytes = [payload_len, self.seq_num, 0xAA, 0xCC]
+        
+        # 3. CRC 計算
+        crc_val = crc16_ibm(payload_bytes)
+        crc_bytes = [(crc_val >> 8) & 0xFF, crc_val & 0xFF]
+        
+        # 轉為 Symbol 索引並對映至 QPSK 點位
+        hdr_syms = [QPSK_POINTS[idx] for idx in bytes_to_symidx(header_bytes)]
+        pay_syms = [QPSK_POINTS[idx] for idx in bytes_to_symidx(payload_bytes + crc_bytes)]
+
+        # 4. 組裝封包
+        packet_syms = (
+            self.dummy_syms + 
+            self.preamble_syms + 
+            hdr_syms + 
+            pay_syms + 
+            self.zeros_syms
+        )
+
+        #print(f"[TX Generator] Sent Packet # {self.seq_num:3d} | Payload Len: {payload_len:2d} Bytes")
+
+        # 流水號遞增 (0~255 循環)
+        self.seq_num = (self.seq_num + 1) % 256
+        return np.array(packet_syms, dtype=np.complex64)
+
+    def work(self, input_items, output_items):
+        out = output_items[0]
+        n_out = len(out)
+
+        # 若 Buffer 資料不足，生成新的封包補滿
+        while len(self.buffer) < n_out:
+            new_pkt = self._generate_next_packet()
+            self.buffer = np.concatenate((self.buffer, new_pkt))
+
+        # 輸出資料至 downstream
+        out[:] = self.buffer[:n_out]
+        self.buffer = self.buffer[n_out:]
+        return n_out
+
+# Dynamic TX Block Wrapper
 class tx_block(gr.hier_block2):
-    def __init__(self, sps=4, alpha=0.35, payload_len=16):
+    def __init__(self, sps=4, alpha=0.35):
         gr.hier_block2.__init__(
             self,
             "tx_block",
@@ -66,84 +147,26 @@ class tx_block(gr.hier_block2):
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
 
-        # helper: bytes -> symbol indices (0..3)
-        def bytes_to_symidx(bl):
-            out = []
-            for b in bl:
-                for shift in (6,4,2,0):
-                    out.append((b >> shift) & 0x03)
-            return out
-
-        # 1) Dummy (complex symbols)
-        dummy_syms = barker_to_qpsk_symbols([1, -1] * 32)
-        self.src_dummy = blocks.vector_source_c(dummy_syms, repeat=True)
-
-        # 2) Preamble (complex symbols)
-        self.src_pre = blocks.vector_source_c(QPSK_PREAMBLE_SYMBOLS, repeat=True)
-
-        # 3) Header (first byte = payload length)
-        header_bytes = [payload_len, 0xAA, 0xCC, 0xEE]
-        header_symidx = bytes_to_symidx(header_bytes)
-        self.src_hdr = blocks.vector_source_b(header_symidx, repeat=True)
-        self.map_hdr = digital.chunks_to_symbols_bc(QPSK_POINTS, 1)
-
-        # 4) Payload + CRC
-        payload_bytes = np.random.randint(0, 256, payload_len, dtype=np.uint8).tolist()
-        #print(f"[TX] Payload bytes: { [hex(b) for b in payload_bytes] }")
-        crc_val = crc16_ibm(payload_bytes)
-        crc_bytes = [(crc_val >> 8) & 0xFF, crc_val & 0xFF]
-        payload_full = payload_bytes + crc_bytes
-        payload_symidx = bytes_to_symidx(payload_full)
-        self.src_pay = blocks.vector_source_b(payload_symidx, repeat=True)
-        self.map_pay = digital.chunks_to_symbols_bc(QPSK_POINTS, 1)
-
-        # 5) Zero padding
-        zeros_syms = [0+0j] * 64
-        self.src_zero = blocks.vector_source_c(zeros_syms, repeat=True)
-
-        # MUX lengths (in complex samples)
-        len_dummy = len(dummy_syms)
-        len_pre = len(QPSK_PREAMBLE_SYMBOLS)
-        len_hdr = len(header_symidx)
-        len_pay = len(payload_symidx)
-        len_zero = len(zeros_syms)
-
-        self.mux = blocks.stream_mux(
-            gr.sizeof_gr_complex,
-            [len_dummy, len_pre, len_hdr, len_pay, len_zero]
-        )
+        self.pkt_gen = dynamic_packet_generator(min_payload_len=8, max_payload_len=32)
 
         # RRC shaping
         rrc = firdes.root_raised_cosine(1.0, samp_rate, sym_rate, alpha, ntaps)
         self.rrc = grfilter.interp_fir_filter_ccf(sps, rrc)
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
-        # Connect
-        self.connect(self.src_dummy, (self.mux, 0))
-        self.connect(self.src_pre,   (self.mux, 1))
-        self.connect(self.src_hdr, self.map_hdr, (self.mux, 2))
-        self.connect(self.src_pay, self.map_pay, (self.mux, 3))
-        self.connect(self.src_zero, (self.mux, 4))
-
-        self.connect(self.mux, self.rrc, self.throttle, self)
+        self.connect(self.pkt_gen, self.rrc, self.throttle, self)
 
 # ============================================================
-# 3. Header strip + phase correction block
-#    - remove preamble + header from stream
-#    - apply coarse phase & ambiguity correction to payload before output
-#    - add tags at payload start in output: payload_len, phase_est, ambiguity_idx
+# 3. Header strip + phase correction block (Updated)
 # ============================================================
-
 class qpsk_header_strip_with_phase(gr.basic_block):
-    """
-    解析 preamble+header，剝掉 preamble+header，並把 payload 輸出前做 phase + ambiguity 補償。
-    修復了 forecast 轉型錯誤、防止滑動視窗尾端被誤吞導致的封包斷裂。
-    """
     def __init__(self, preamble_len_syms, header_len_bytes=4, max_payload_bytes=256):
-        gr.basic_block.__init__(self,
-                               name="qpsk_header_strip_with_phase",
-                               in_sig=[np.complex64],
-                               out_sig=[np.complex64])
+        gr.basic_block.__init__(
+            self,
+            name="qpsk_header_strip_with_phase",
+            in_sig=[np.complex64],
+            out_sig=[np.complex64]
+        )
         self.pre_len_syms = int(preamble_len_syms)
         self.header_len_bytes = int(header_len_bytes)
         self.header_len_syms = self.header_len_bytes * 4
@@ -153,17 +176,13 @@ class qpsk_header_strip_with_phase(gr.basic_block):
 
         self.max_payload_bytes = int(max_payload_bytes)
         self.max_payload_syms = (self.max_payload_bytes + 2) * 4
-        # 一個完整封包最大可能需要的點數
         self.max_packet_samples = 1 + self.pre_len_syms + self.header_len_syms + self.max_payload_syms
         self.set_output_multiple(self.max_packet_samples)
 
-
     def forecast(self, noutput_items, ninputs):
-        # 要求 scheduler 至少提供一個完整 packet 的 input
         need = self.max_packet_samples
-        ninput_items_required = [need] * ninputs
-        return ninput_items_required
-       
+        return [need] * ninputs
+
     def _get_phase_est_from_tag(self, tag):
         phase_est = 0.0
         if pmt.is_dict(tag.value):
@@ -176,8 +195,7 @@ class qpsk_header_strip_with_phase(gr.basic_block):
         rotations = self._rots
         metric = [np.real(np.sum(pre_iq * np.conj(self.ref_preamble * rot))) for rot in rotations]
         best_rot_idx = int(np.argmax(metric))
-        best_rot = rotations[best_rot_idx]
-        return best_rot_idx, best_rot
+        return best_rot_idx, rotations[best_rot_idx]
 
     def general_work(self, input_items, output_items):
         in_iq = input_items[0]
@@ -188,30 +206,24 @@ class qpsk_header_strip_with_phase(gr.basic_block):
         if n_in == 0 or n_out_avail == 0:
             return 0
 
-        # 取得當前 window 的所有 tags
         tags = self.get_tags_in_window(0, 0, n_in)
         corr_tags = [t for t in tags if t.key == pmt.intern("corr_start")]
         corr_tags.sort(key=lambda x: int(x.offset))
 
-        # 絕對讀取基底
         n_read_abs = self.nitems_read(0)
 
-        # 如果沒有找到任何標籤，代表這整段都是普通噪訊或無用訊號，直接 Passthrough 輸出
         if not corr_tags:
             write_len = min(n_in, n_out_avail)
             out_iq[:write_len] = in_iq[:write_len]
             self.consume(0, write_len)
             return write_len
 
-        # 追蹤我們處理到 input 的哪個位置 (相對 index)
         in_pos = 0
         out_pos = 0
-        #print(f"[HeaderStrip] n_in={n_in}, n_out_avail={n_out_avail}, tags={len(corr_tags)}")
+
         for t in corr_tags:
-            # 計算 tag 在當前 input_items 中的相對位置
             rel_idx = int(t.offset - n_read_abs)
-            
-            # 如果這個標籤的位置在我們已經處理過的 in_pos 之前，直接跳過
+
             if rel_idx < in_pos:
                 continue
 
@@ -220,72 +232,58 @@ class qpsk_header_strip_with_phase(gr.basic_block):
             hdr_start = pre_end
             hdr_end = hdr_start + self.header_len_syms
 
-            # 檢查 1：如果連 Header 都拿不全，說明封包斷在 window 邊界
-            # 停止處理，保留現狀，等待更多數據進來
             if hdr_end > n_in:
                 break
 
-            # 讀取相角並解析 Header 內容以獲取 Payload 長度
             phase_est = self._get_phase_est_from_tag(t)
             pre_iq = in_iq[pre_start:pre_end] * np.exp(-1j * phase_est)
             best_rot_idx, best_rot = self._resolve_ambiguity(pre_iq)
 
+            # 解碼 Header (4 Bytes)
             hdr_iq = in_iq[hdr_start:hdr_end] * np.exp(-1j * phase_est) * np.conj(best_rot)
             hdr_syms = [self.qpsk_const.decision_maker(s) for s in hdr_iq]
             header_bytes = []
             for i in range(0, self.header_len_syms, 4):
                 byte_val = (int(hdr_syms[i]) << 6) | (int(hdr_syms[i+1]) << 4) | (int(hdr_syms[i+2]) << 2) | int(hdr_syms[i+3])
                 header_bytes.append(int(byte_val))
-            payload_len = int(header_bytes[0])
 
-            # 計算 Payload 邊界
+            payload_len = int(header_bytes[0])
+            seq_num = int(header_bytes[1])
+
             pay_start = hdr_end
             total_payload_syms = (payload_len + 2) * 4
             pay_end = pay_start + total_payload_syms
 
-            # 檢查 2：如果 Payload 點數不夠，說明後半段還沒進來
-            # 停止處理，保留這個標籤之後的訊號
             if pay_end > n_in:
                 break
 
-            # 計算當前位置到封包起點之前的普通訊號長度 (Passthrough 段)
             passthrough_len = pre_start - in_pos
-            
-            # 檢查 3：檢查 Output 空間是否足夠容納 (Passthrough 訊號 + Payload 訊號)
+
             if out_pos + passthrough_len + total_payload_syms > n_out_avail:
-                # 空間不足，為了避免破壞封包，我們在此中斷，把處理權交還 Scheduler
                 break
 
-            # --- 開始寫入 Output ---
-            # 1) 複製封包前的 Passthrough 訊號
             if passthrough_len > 0:
                 out_iq[out_pos:out_pos+passthrough_len] = in_iq[in_pos:pre_start]
                 out_pos += passthrough_len
 
-            # 2) 補償並複製 Payload 訊號
             pay_iq = in_iq[pay_start:pay_end] * np.exp(-1j * phase_est) * np.conj(best_rot)
             out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
 
-            # 3) 附加新的標籤到 Output
+            # 將 payload_len 以及 seq_num 綁定到 Tag 傳遞給下游
             payload_start_out_abs = self.nitems_written(0) + out_pos
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("payload_len"), pmt.from_long(payload_len))
+            self.add_item_tag(0, payload_start_out_abs, pmt.intern("seq_num"), pmt.from_long(seq_num))
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("phase_est"), pmt.from_double(phase_est))
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("ambiguity_idx"), pmt.from_long(best_rot_idx))
 
             out_pos += len(pay_iq)
-            in_pos = pay_end  # 更新已消耗的 input 指標
+            in_pos = pay_end
 
-            phase_deg = np.degrees(phase_est)
-            #print(f"[HeaderStrip] Processed packet: Header={ [hex(b) for b in header_bytes] }, len={payload_len}, phase={phase_deg:.1f}°, amb={best_rot_idx}, t.offset={t.offset}")
-
-        # 如果處理完完整的封包後，後面還殘留一些訊號，且這些訊號在所有已知標籤之前（或是已經沒標籤了）
-        # 我們可以安全地進行流式 Passthrough，直到下一個「未處理的封包」或 window 邊界
-        # 為了絕對安全，若有未處理完的 tag 留著，我們只 passthrough 到那個 tag 的 pre_start 之前
         next_tag_idx = n_in
         for t in corr_tags:
             r_idx = int(t.offset - n_read_abs)
             if r_idx >= in_pos:
-                next_tag_idx = r_idx + 1 # 包含開頭那個點
+                next_tag_idx = r_idx + 1
                 break
 
         tail_passthrough = next_tag_idx - in_pos
@@ -296,23 +294,15 @@ class qpsk_header_strip_with_phase(gr.basic_block):
                 out_pos += write_tail
                 in_pos += write_tail
 
-        # 確實消耗掉已經處理完成的數據
         if in_pos > 0:
             self.consume(0, in_pos)
 
         return out_pos
 
-
 # ============================================================
-# 4. Payload parser from symbol indices (after constellation_decoder_cb)
-#    - input: uint8 symbols (0..3)
-#    - expects tags at payload start: payload_len (pmt long)
+# 4. Payload parser from symbol indices (Updated)
 # ============================================================
 class payload_parser_from_symbols(gr.basic_block):
-    """
-    Input: symbol indices stream (uint8) from constellation_decoder_cb
-    Expects tags at payload start (payload_len)
-    """
     def __init__(self):
         gr.basic_block.__init__(self, name="payload_parser_from_symbols", in_sig=[np.uint8], out_sig=None)
 
@@ -338,14 +328,16 @@ class payload_parser_from_symbols(gr.basic_block):
             rel_idx = int(abs_offset - self.nitems_read(0))
 
             payload_len_pmt = self._get_tag_value_at_offset(tags, pmt.intern("payload_len"), abs_offset)
+            seq_num_pmt = self._get_tag_value_at_offset(tags, pmt.intern("seq_num"), abs_offset)
+
             if payload_len_pmt is None:
                 continue
 
             payload_len = int(pmt.to_long(payload_len_pmt))
+            seq_num = int(pmt.to_long(seq_num_pmt)) if seq_num_pmt is not None else -1
 
-            # 修正點：Header 已經被剝離，rel_idx 本身就是 Payload 起點
             pay_start = rel_idx 
-            total_payload_syms = (payload_len + 2) * 4  # Payload + 2 bytes CRC
+            total_payload_syms = (payload_len + 2) * 4  # Payload + CRC(2 bytes)
             pay_end = pay_start + total_payload_syms
 
             if pay_start < 0 or pay_end > n:
@@ -353,7 +345,7 @@ class payload_parser_from_symbols(gr.basic_block):
 
             pay_syms = [int(x) for x in syms[pay_start:pay_end]]
 
-            # 將 4 個 2-bit symbols 組合回 1 個 Byte
+            # 重組 4 個 2-bit symbol 為 1 Byte
             bytes_out = []
             for i in range(0, len(pay_syms), 4):
                 b = (pay_syms[i] << 6) | (pay_syms[i+1] << 4) | (pay_syms[i+2] << 2) | (pay_syms[i+3])
@@ -366,15 +358,14 @@ class payload_parser_from_symbols(gr.basic_block):
             crc_rx = (bytes_out[payload_len] << 8) | bytes_out[payload_len + 1]
             crc_calc = crc16_ibm(payload)
 
-            #print(f"[Payload Parser] payload_len={payload_len} | payload={[hex(b) for b in payload]}")
             if crc_rx == crc_calc:
-                pass
-                #print(f"[Payload CRC] PASS | RX CRC={hex(crc_rx)}")
+                print(f"[RX Parser]  PASS | Packet #{seq_num:3d} | Len: {payload_len:2d} Bytes | Payload Head: {[hex(b) for b in payload[:4]]}...")
             else:
-                print(f"[Payload CRC] FAIL | RX CRC={hex(crc_rx)} Calc={hex(crc_calc)}")
+                print(f"[RX Parser]  FAIL | Packet #{seq_num:3d} | CRC Mismatch! RX:{hex(crc_rx)} Calc:{hex(crc_calc)}")
 
         self.consume(0, n)
         return 0
+
 # ============================================================
 # 5. RX Block (assemble pipeline)
 # ============================================================
@@ -416,28 +407,20 @@ class rx_block(gr.hier_block2):
             preamble_symbols.tolist(), sps=1, mark_delay=0, threshold=0.30
         )
 
-        # header strip (remove preamble+header, output corrected payload)
         self.header_strip = qpsk_header_strip_with_phase(preamble_len_syms=len(QPSK_PREAMBLE_SYMBOLS), header_len_bytes=4)
-
-        # decoder: complex -> symbol indices (uint8)
         self.qpsk_decoder = digital.constellation_decoder_cb(QPSK_CONST)
-
-        # payload parser (from symbol indices)
         self.payload_parser_sym = payload_parser_from_symbols()
 
-        # GUI const sink
         self.qt_pre = qtgui.const_sink_c(256, 'Constellation Diagram', 1)
 
-        # connections
+        # Connections
         self.connect(self, self.symbol_sync)
         self.connect(self.symbol_sync, self.gain_fix)
         self.connect(self.gain_fix, self.agc)
         self.connect(self.agc, self.costas)
 
-        # tap constellation at Costas
         self.connect(self.costas, self.qt_pre)
 
-        # corr -> header_strip -> decoder -> payload parser
         self.connect(self.costas, self.corr)
         self.connect(self.corr, self.header_strip)
         self.connect(self.header_strip, self.qpsk_decoder)
@@ -453,9 +436,8 @@ class top_gui(Qt.QWidget):
 
         sps = 4
         alpha = 0.35
-        payload_len = 16
 
-        self.tx = tx_block(sps, alpha, payload_len=payload_len)
+        self.tx = tx_block(sps, alpha)
         self.rx = rx_block(sps, alpha)
 
         self.channel = channels.channel_model(
@@ -487,7 +469,7 @@ class top_gui(Qt.QWidget):
 if __name__ == "__main__":
     qapp = Qt.QApplication(sys.argv)
     win = top_gui()
-    win.setWindowTitle("QPSK: header strip + payload CRC demo")
+    win.setWindowTitle("QPSK: Dynamic Payload & Sequence Number Demo")
     win.resize(800, 600)
     win.show()
     sys.exit(qapp.exec_())

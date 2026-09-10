@@ -14,7 +14,7 @@ from qpsk_symbol_dsp import *
 from QAM16_symbol_dsp import *
 from QAM64_symbol_dsp import *
 from QAM256_symbol_dsp import *
-
+from pkt_trx_example_qpsk import *
 
 # ---------------------------------------------------------
 #  主程式
@@ -37,6 +37,7 @@ class qpsk_cable_demo(gr.top_block):
         #self.sym_dsp_rx = QAM64_RX_block(sps=sps, samp_rate=samp_rate)
         self.sym_dsp_tx = QAM256_TX_block(sps=sps, samp_rate=samp_rate)
         self.sym_dsp_rx = QAM256_RX_block(sps=sps, samp_rate=samp_rate)
+
 
         n_symbols = 200000
         constellation_point = self.sym_dsp_rx.constellation_point
@@ -224,7 +225,130 @@ def run_zeroMQ():
         tb.stop()
         tb.wait()
 
+
+class pkt_trx_demo(gr.top_block):
+    def __init__(self):
+        gr.top_block.__init__(self)
+
+        samp_rate = 1_000_000
+        sps = 4
+        buf_len = 16384
+        alpha = 0.35
+                      
+        self.sym_dsp_tx = tx_block(sps, samp_rate, alpha)
+        self.sym_dsp_rx = rx_block(sps, samp_rate, alpha)
+
+
+        n_symbols = 200000
+        constellation_point = 4
+
+
+        if RF_CH_MODEL:
+            isi_taps = [1.0 + 0.0j, 0.25 + 0.1j, 0.15 - 0.05j]
+            self.pluto = channels.channel_model(
+                                                noise_voltage=0.03,        # 高斯白雜訊 (AWGN)
+                                                frequency_offset=0.0002,   # 頻率偏差 (CFO)
+                                                epsilon=1.0,               # 採樣率偏差 (SFO)
+                                                taps=isi_taps,             # 【注入 ISI 通道響應】
+                                                noise_seed=42,
+                                                block_tags=False
+                                                )
+            #self.pluto = channel_model_txrx(
+            #                            samp_rate=samp_rate,
+            #                            noise_voltage=0.002,
+            #                            freq_offset=20,
+            #                            multipath_taps=[1.0, 0.3+0.1j, 0.1]
+            #                           )    
+        else:
+            self.pluto = PlutoSDR_txrx_stream(
+                uri="ip:192.168.1.10",
+                samp_rate=samp_rate,
+                tx_lo=915e6,
+                rx_lo=915e6,
+                buf_len=buf_len
+            )   
+        
+        
+
+        self.freq_sink = qtgui.freq_sink_c(
+            8192,
+            fft.window.WIN_HAMMING,
+            0,
+            samp_rate,
+            "Rx Spectrum (1MHz)"
+        )
+        self.freq_win = sip.wrapinstance(self.freq_sink.qwidget(), Qt.QWidget)
+        self.freq_sink.set_fft_average(0.3)
+
+        #self.const_sink = qtgui.const_sink_c(
+        #    1024,
+        #    "PKT Loopback QPSK (1MHz)",
+        #    1
+        #)
+        #self.const_sink.set_x_axis(-2.0, 2.0)
+        #self.const_sink.set_y_axis(-2.0, 2.0)
+        self.const_win = sip.wrapinstance(self.sym_dsp_rx.qt_pre.qwidget(), Qt.QWidget)
+
+        const = QPSK_CONST
+        raw_pts = np.array(const.points(), dtype=np.complex64)
+        points = raw_pts / np.abs(raw_pts[0])
+        self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
+
+        self.evm_sink = qtgui.number_sink(
+            gr.sizeof_float,
+            0.5,
+            qtgui.NUM_GRAPH_HORIZ,
+            1,
+            None
+        )
+        self.evm_sink.set_title("EVM (%)")
+        self.evm_sink.set_update_time(2.0)
+        self.evm_sink.set_min(0, -20)
+        self.evm_sink.set_max(0, 20)
+        self.evm_sink_win = sip.wrapinstance(self.evm_sink.qwidget(), Qt.QWidget)
+               
+
+        # 新增：bit output 的空 sink
+        self.bit_sink = blocks.null_sink(gr.sizeof_char)
+
+        # TX path
+        self.connect(self.sym_dsp_tx, self.pluto)
+
+        # Spectrum
+        self.connect(self.pluto, self.freq_sink)
+
+        # RX symbols + bits
+        self.connect(self.pluto, self.sym_dsp_rx)        
+
+        # constellation
+        #self.connect((self.sym_dsp_rx, 0), (self.const_sink, 0))
+
+        # EVM
+        #self.connect((self.sym_dsp_rx, 0), self.evm,self.evm_sink)        
+
+        # 新增：bit output 接到 null sink
+        #self.connect((self.sym_dsp_rx, 1), self.bit_sink)
+
+def run_pkt_demo():
+    app = Qt.QApplication(sys.argv)
+    tb = pkt_trx_demo()
+
+    win = Qt.QWidget()
+    layout = Qt.QVBoxLayout(win)
+    layout.addWidget(tb.freq_win)
+    layout.addWidget(tb.const_win)
+    layout.addWidget(tb.evm_sink_win)
+    win.show()
+
+    tb.start()
+    app.exec_()
+    tb.stop()
+    tb.wait()
+
+
+
 if __name__ == "__main__":
     #print([attr for attr in dir(digital) if attr.startswith("TED_")])
-    run_demo()
+    #run_demo()
+    run_pkt_demo()
     #run_zeroMQ()

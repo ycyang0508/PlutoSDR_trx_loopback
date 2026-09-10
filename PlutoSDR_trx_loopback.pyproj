@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>07cdc9ea-1e0a-4b92-aa03-f47e508743b9</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>pkt_trx_example_qpsk.py</StartupFile>
+    <StartupFile>PlutoSDR_trx_loopback_E310.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>

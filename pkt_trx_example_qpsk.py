@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Full QPSK demo (Dynamic Packet Version):
-- TX: Dynamic Packet Generator (Variable payload len, variable payload content, Sequence Number in Header)
-- channel_model
-- RX: symbol_sync -> AGC -> Costas -> corr_est_cc -> header strip -> constellation_decoder -> payload parser (CRC check)
-- GUI constellation tap (after Costas)
+Full QPSK demo (Dynamic Packet Version with Equalizer & Multi-path ISI Channel):
+- TX: Dynamic Packet Generator
+- channel_model (with Multipath ISI)
+- RX: symbol_sync -> AGC1 -> Linear Equalizer (CMA) -> AGC2 -> Costas -> corr_est_cc -> header strip -> decoder -> parser
 """
 import sys
 import time
@@ -51,7 +50,6 @@ def barker_to_qpsk_symbols(barker_list):
 QPSK_PREAMBLE_SYMBOLS = barker_to_qpsk_symbols(BARKER_26_BITS)
 
 def bytes_to_symidx(bl):
-    """ Helper: bytes list -> QPSK symbol indices (0..3) """
     out = []
     for b in bl:
         for shift in (6, 4, 2, 0):
@@ -62,15 +60,6 @@ def bytes_to_symidx(bl):
 # 2. Dynamic TX Packet Source Block
 # ============================================================
 class dynamic_packet_generator(gr.sync_block):
-    """
-    動態 Packet 產生器 Block：
-    每個封包包含：
-    1. Dummy symbols (64 個)
-    2. Preamble (26 個 QPSK 符號)
-    3. Header (4 Bytes: [Payload Len, Seq Num, 0xAA, 0xCC])
-    4. Payload (隨機長度 8~32 Bytes, 隨機內容) + CRC16 (2 Bytes)
-    5. Zero Padding (64 個)
-    """
     def __init__(self, min_payload_len=8, max_payload_len=32):
         gr.sync_block.__init__(
             self,
@@ -89,22 +78,17 @@ class dynamic_packet_generator(gr.sync_block):
         self.buffer = np.array([], dtype=np.complex64)
 
     def _generate_next_packet(self):
-        # 1. 動態決定長度與內容
         payload_len = np.random.randint(self.min_len, self.max_len + 1)
         payload_bytes = np.random.randint(0, 256, payload_len, dtype=np.uint8).tolist()
         
-        # 2. Header 包含: [Payload Len, Seq Num, 0xAA, 0xCC]
         header_bytes = [payload_len, self.seq_num, 0xAA, 0xCC]
         
-        # 3. CRC 計算
         crc_val = crc16_ibm(payload_bytes)
         crc_bytes = [(crc_val >> 8) & 0xFF, crc_val & 0xFF]
         
-        # 轉為 Symbol 索引並對映至 QPSK 點位
         hdr_syms = [QPSK_POINTS[idx] for idx in bytes_to_symidx(header_bytes)]
         pay_syms = [QPSK_POINTS[idx] for idx in bytes_to_symidx(payload_bytes + crc_bytes)]
 
-        # 4. 組裝封包
         packet_syms = (
             self.dummy_syms + 
             self.preamble_syms + 
@@ -113,9 +97,6 @@ class dynamic_packet_generator(gr.sync_block):
             self.zeros_syms
         )
 
-        #print(f"[TX Generator] Sent Packet # {self.seq_num:3d} | Payload Len: {payload_len:2d} Bytes")
-
-        # 流水號遞增 (0~255 循環)
         self.seq_num = (self.seq_num + 1) % 256
         return np.array(packet_syms, dtype=np.complex64)
 
@@ -123,19 +104,16 @@ class dynamic_packet_generator(gr.sync_block):
         out = output_items[0]
         n_out = len(out)
 
-        # 若 Buffer 資料不足，生成新的封包補滿
         while len(self.buffer) < n_out:
             new_pkt = self._generate_next_packet()
             self.buffer = np.concatenate((self.buffer, new_pkt))
 
-        # 輸出資料至 downstream
         out[:] = self.buffer[:n_out]
         self.buffer = self.buffer[n_out:]
         return n_out
 
-# Dynamic TX Block Wrapper
 class tx_block(gr.hier_block2):
-    def __init__(self, sps=4, alpha=0.35):
+    def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
         gr.hier_block2.__init__(
             self,
             "tx_block",
@@ -143,13 +121,11 @@ class tx_block(gr.hier_block2):
             gr.io_signature(1,1,gr.sizeof_gr_complex)
         )
 
-        samp_rate = 100000
+        samp_rate = samp_rate
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
 
         self.pkt_gen = dynamic_packet_generator(min_payload_len=8, max_payload_len=32)
-
-        # RRC shaping
         rrc = firdes.root_raised_cosine(1.0, samp_rate, sym_rate, alpha, ntaps)
         self.rrc = grfilter.interp_fir_filter_ccf(sps, rrc)
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
@@ -157,7 +133,7 @@ class tx_block(gr.hier_block2):
         self.connect(self.pkt_gen, self.rrc, self.throttle, self)
 
 # ============================================================
-# 3. Header strip + phase correction block (Updated)
+# 3. Header strip + phase correction block
 # ============================================================
 class qpsk_header_strip_with_phase(gr.basic_block):
     def __init__(self, preamble_len_syms, header_len_bytes=4, max_payload_bytes=256):
@@ -211,7 +187,6 @@ class qpsk_header_strip_with_phase(gr.basic_block):
         corr_tags.sort(key=lambda x: int(x.offset))
 
         n_read_abs = self.nitems_read(0)
-
         if not corr_tags:
             write_len = min(n_in, n_out_avail)
             out_iq[:write_len] = in_iq[:write_len]
@@ -219,8 +194,7 @@ class qpsk_header_strip_with_phase(gr.basic_block):
             return write_len
 
         in_pos = 0
-        out_pos = 0
-
+        out_pos = 0        
         for t in corr_tags:
             rel_idx = int(t.offset - n_read_abs)
 
@@ -239,7 +213,6 @@ class qpsk_header_strip_with_phase(gr.basic_block):
             pre_iq = in_iq[pre_start:pre_end] * np.exp(-1j * phase_est)
             best_rot_idx, best_rot = self._resolve_ambiguity(pre_iq)
 
-            # 解碼 Header (4 Bytes)
             hdr_iq = in_iq[hdr_start:hdr_end] * np.exp(-1j * phase_est) * np.conj(best_rot)
             hdr_syms = [self.qpsk_const.decision_maker(s) for s in hdr_iq]
             header_bytes = []
@@ -269,7 +242,6 @@ class qpsk_header_strip_with_phase(gr.basic_block):
             pay_iq = in_iq[pay_start:pay_end] * np.exp(-1j * phase_est) * np.conj(best_rot)
             out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
 
-            # 將 payload_len 以及 seq_num 綁定到 Tag 傳遞給下游
             payload_start_out_abs = self.nitems_written(0) + out_pos
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("payload_len"), pmt.from_long(payload_len))
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("seq_num"), pmt.from_long(seq_num))
@@ -300,7 +272,7 @@ class qpsk_header_strip_with_phase(gr.basic_block):
         return out_pos
 
 # ============================================================
-# 4. Payload parser from symbol indices (Updated)
+# 4. Payload parser from symbol indices
 # ============================================================
 class payload_parser_from_symbols(gr.basic_block):
     def __init__(self):
@@ -337,7 +309,7 @@ class payload_parser_from_symbols(gr.basic_block):
             seq_num = int(pmt.to_long(seq_num_pmt)) if seq_num_pmt is not None else -1
 
             pay_start = rel_idx 
-            total_payload_syms = (payload_len + 2) * 4  # Payload + CRC(2 bytes)
+            total_payload_syms = (payload_len + 2) * 4
             pay_end = pay_start + total_payload_syms
 
             if pay_start < 0 or pay_end > n:
@@ -345,7 +317,6 @@ class payload_parser_from_symbols(gr.basic_block):
 
             pay_syms = [int(x) for x in syms[pay_start:pay_end]]
 
-            # 重組 4 個 2-bit symbol 為 1 Byte
             bytes_out = []
             for i in range(0, len(pay_syms), 4):
                 b = (pay_syms[i] << 6) | (pay_syms[i+1] << 4) | (pay_syms[i+2] << 2) | (pay_syms[i+3])
@@ -367,18 +338,18 @@ class payload_parser_from_symbols(gr.basic_block):
         return 0
 
 # ============================================================
-# 5. RX Block (assemble pipeline)
+# 5. RX Block (assemble pipeline with Equalizer & Dual AGC)
 # ============================================================
 class rx_block(gr.hier_block2):
-    def __init__(self, sps=4, alpha=0.35):
+    def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
         gr.hier_block2.__init__(
             self,
             "rx_block",
-            gr.io_signature(1,1,gr.sizeof_gr_complex),
-            gr.io_signature(0,0,0)
+            gr.io_signature(1, 1, gr.sizeof_gr_complex),
+            gr.io_signature(0, 0, 0)
         )
 
-        samp_rate = 100000
+        samp_rate = samp_rate
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
 
@@ -399,35 +370,51 @@ class rx_block(gr.hier_block2):
         )
 
         self.gain_fix = blocks.multiply_const_cc(1.0)
-        self.agc = analog.agc2_cc(1e-3, 1e-4, 1, 1.0)
+        self.agc1 = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+
+        # Equalizer (CMA)
+        eq_algo = digital.adaptive_algorithm_cma(
+            QPSK_CONST,
+            0.01,
+            1.0
+        ).base()
+
+        self.equalizer = digital.linear_equalizer(
+            15,
+            1,
+            eq_algo
+        )
+
+        self.agc2 = analog.agc2_cc(1e-4, 1e-5, 1.0, 1.0)
         self.costas = digital.costas_loop_cc(0.0628, 4)
 
         preamble_symbols = np.array(QPSK_PREAMBLE_SYMBOLS, dtype=np.complex64)
         self.corr = digital.corr_est_cc(
-            preamble_symbols.tolist(), sps=1, mark_delay=0, threshold=0.30
+            preamble_symbols.tolist(), sps=1, mark_delay=0, threshold=0.25
         )
 
         self.header_strip = qpsk_header_strip_with_phase(preamble_len_syms=len(QPSK_PREAMBLE_SYMBOLS), header_len_bytes=4)
         self.qpsk_decoder = digital.constellation_decoder_cb(QPSK_CONST)
         self.payload_parser_sym = payload_parser_from_symbols()
 
-        self.qt_pre = qtgui.const_sink_c(256, 'Constellation Diagram', 1)
+        self.qt_pre = qtgui.const_sink_c(256, 'Constellation Diagram (After Costas & EQ)', 1)
 
         # Connections
         self.connect(self, self.symbol_sync)
         self.connect(self.symbol_sync, self.gain_fix)
-        self.connect(self.gain_fix, self.agc)
-        self.connect(self.agc, self.costas)
+        self.connect(self.gain_fix, self.agc1)
+        self.connect(self.agc1, self.equalizer)
+        self.connect(self.equalizer, self.agc2)
+        self.connect(self.agc2, self.costas)
 
         self.connect(self.costas, self.qt_pre)
-
         self.connect(self.costas, self.corr)
         self.connect(self.corr, self.header_strip)
         self.connect(self.header_strip, self.qpsk_decoder)
         self.connect(self.qpsk_decoder, self.payload_parser_sym)
 
 # ============================================================
-# 6. GUI Top Block
+# 6. GUI Top Block (ISI Channel Added)
 # ============================================================
 class top_gui(Qt.QWidget):
     def __init__(self):
@@ -436,15 +423,25 @@ class top_gui(Qt.QWidget):
 
         sps = 4
         alpha = 0.35
+        samp_rate = 1_000_000
 
-        self.tx = tx_block(sps, alpha)
-        self.rx = rx_block(sps, alpha)
+        self.tx = tx_block(sps, samp_rate, alpha)
+        self.rx = rx_block(sps, samp_rate, alpha)
+
+        # ========================================================
+        # 【新增】多路徑 ISI 通道設定 (Multipath Taps)
+        # ========================================================
+        # [1.0, 0.25+0.1j, 0.15-0.05j] 代表：
+        # - Tap 0: 主要直射波 (Direct path)
+        # - Tap 1: 第一條反射多路徑，造成前一個 Symbol 的能量重疊 (產生 ISI)
+        # - Tap 2: 第二條反射多路徑 (強度較弱)
+        isi_taps = [1.0 + 0.0j, 0.25 + 0.1j, 0.15 - 0.05j]
 
         self.channel = channels.channel_model(
-            noise_voltage=0.05,
-            frequency_offset=0.0002,
-            epsilon=1.0,
-            taps=[1.0+0j],
+            noise_voltage=0.03,        # 高斯白雜訊 (AWGN)
+            frequency_offset=0.0002,   # 頻率偏差 (CFO)
+            epsilon=1.0,               # 採樣率偏差 (SFO)
+            taps=isi_taps,             # 【注入 ISI 通道響應】
             noise_seed=42,
             block_tags=False
         )
@@ -469,7 +466,7 @@ class top_gui(Qt.QWidget):
 if __name__ == "__main__":
     qapp = Qt.QApplication(sys.argv)
     win = top_gui()
-    win.setWindowTitle("QPSK: Dynamic Payload & Sequence Number Demo")
+    win.setWindowTitle("QPSK: Dynamic Payload Demo with Equalizer & ISI Channel")
     win.resize(800, 600)
     win.show()
     sys.exit(qapp.exec_())

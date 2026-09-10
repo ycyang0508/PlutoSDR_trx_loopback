@@ -184,12 +184,12 @@ class rx_block(gr.hier_block2):
     )
 
     self.gain_fix = blocks.multiply_const_cc(3.0)
-    self.agc = analog.agc2_cc(1e-3, 1e-4, 1.5, 1.0)
+    self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
     self.costas = digital.costas_loop_cc(0.0628, 4)
 
     preamble_symbols = np.array(QPSK_PREAMBLE_SYMBOLS, dtype=np.complex64)
     self.corr = digital.corr_est_cc(
-        preamble_symbols.tolist(), sps=1, mark_delay=0, threshold=0.6
+        preamble_symbols.tolist(), sps=1, mark_delay=0, threshold=0.3
     )
 
     self.header_parser = qpsk_header_parser(

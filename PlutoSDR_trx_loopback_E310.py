@@ -252,13 +252,7 @@ class pkt_trx_demo(gr.top_block):
                                                 taps=isi_taps,             # 【注入 ISI 通道響應】
                                                 noise_seed=42,
                                                 block_tags=False
-                                                )
-            #self.pluto = channel_model_txrx(
-            #                            samp_rate=samp_rate,
-            #                            noise_voltage=0.002,
-            #                            freq_offset=20,
-            #                            multipath_taps=[1.0, 0.3+0.1j, 0.1]
-            #                           )    
+                                                )            
         else:
             self.pluto = PlutoSDR_txrx_stream(
                 uri="ip:192.168.1.10",
@@ -267,9 +261,7 @@ class pkt_trx_demo(gr.top_block):
                 rx_lo=915e6,
                 buf_len=buf_len
             )   
-        
-        
-
+                
         self.freq_sink = qtgui.freq_sink_c(
             8192,
             fft.window.WIN_HAMMING,

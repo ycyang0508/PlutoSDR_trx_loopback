@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>07cdc9ea-1e0a-4b92-aa03-f47e508743b9</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>PlutoSDR_trx_loopback_E310.py</StartupFile>
+    <StartupFile>pkt_trx_example_16QAM.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -25,6 +25,7 @@
     <Compile Include="custom_blocks.py" />
     <Compile Include="flow_demux_example.py" />
     <Compile Include="flow_mux_example.py" />
+    <Compile Include="pkt_trx_example_16QAM.py" />
     <Compile Include="pkt_trx_example_qpsk.py" />
     <Compile Include="pkt_trx_example_bpsk.py" />
     <Compile Include="PlutoSDR_trx_loopback_E310.py" />

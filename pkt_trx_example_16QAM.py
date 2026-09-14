@@ -215,7 +215,8 @@ class qam16_header_strip_with_phase(gr.basic_block):
     def general_work(self, input_items, output_items):
         in_iq = input_items[0]
         out_iq = output_items[0]
-        
+
+        n_in = len(in_iq)
         n_out_avail = len(out_iq)
         if n_in == 0 or n_out_avail == 0:
             return 0
@@ -233,7 +234,7 @@ class qam16_header_strip_with_phase(gr.basic_block):
 
         in_pos = 0
         out_pos = 0    
-        print(f"tag num {len(tags)}")
+        #print(f"tag num {len(tags)}")
         for t in corr_tags:
             # 抑制距離過近的 Barker 副峰 Ghost Tag
             if t.offset - self.last_processed_offset < (self.pre_len_syms + self.header_len_syms):

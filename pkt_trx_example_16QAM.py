@@ -2,21 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 16QAM Continuous Packet Receiver with Header Strip & Phase Ambiguity Resolution
+Updated Architecture: Clean DSP Chain Processing
 """
 import sys
 import time
-from gnuradio import analog
-from gnuradio import blocks
-from gnuradio import digital
-from gnuradio import filter
-from gnuradio import gr
-from gnuradio import qtgui
-from gnuradio.filter import firdes
-from gnuradio import channels
 import numpy as np
 import pmt
 from PyQt5 import Qt
 import sip
+
+from gnuradio import analog, blocks, digital, filter, gr, qtgui, channels
+from gnuradio.filter import firdes
 
 # ============================================================
 # CRC-16 (IBM)
@@ -45,8 +41,6 @@ def barker_to_16qam_symbols(barker_list):
     return [QAM16_POINTS[0] if v == 1 else QAM16_POINTS[15] for v in barker_list]
 
 QAM16_PREAMBLE_SYMBOLS = barker_to_16qam_symbols(BARKER_26_BITS)
-
-# 相位旋轉因子 (0, 90, 180, 270 度)
 PHASE_ROTATIONS = [1+0j, 0+1j, -1+0j, 0-1j]
 
 # ============================================================
@@ -80,8 +74,6 @@ class sequential_packet_gen(gr.sync_block):
 
     def _generate_next_packet_symbols(self):
         payload_bytes = np.arange(0, self.payload_len, 1, dtype=np.uint8).tolist()
-        
-        # Header 格式: [0x10, Seq_Num, Payload_Len, 0xAB]
         header_bytes = [0x10, self.seq_num, self.payload_len, 0xAB]
         crc_val = crc16_ibm(payload_bytes)
         crc_bytes = [(crc_val >> 8) & 0xFF, crc_val & 0xFF]
@@ -90,9 +82,7 @@ class sequential_packet_gen(gr.sync_block):
         
         nibbles = []
         for b in all_bytes:
-            msb = (b >> 4) & 0x0F
-            lsb = b & 0x0F
-            nibbles.extend([msb, lsb])
+            nibbles.extend([(b >> 4) & 0x0F, b & 0x0F])
 
         data_syms = self._nibbles_to_symbols(nibbles)
 
@@ -141,7 +131,7 @@ class tx_block(gr.hier_block2):
         self.connect(self.pkt_gen, self.rrc, self.throttle, self)
 
 # ============================================================
-# 4. 16QAM Header Strip with Phase Ambiguity Resolution Block
+# 4. Header Strip & Ambiguity Resolution Block
 # ============================================================
 class qam16_header_strip_with_phase(gr.basic_block):
     def __init__(self, preamble_len_syms, header_len_bytes=4, max_payload_bytes=256):
@@ -163,29 +153,69 @@ class qam16_header_strip_with_phase(gr.basic_block):
         self.max_packet_samples = 1 + self.pre_len_syms + self.header_len_syms + self.max_payload_syms
         self.set_output_multiple(self.max_packet_samples)
 
-    def forecast(self, noutput_items, ninputs):
-        need = self.max_packet_samples
-        return [need] * ninputs
+        self.last_processed_offset = -1000
 
-    def _get_phase_est_from_tag(self, tag):
-        phase_est = 0.0
-        if pmt.is_dict(tag.value):
-            phase_pmt = pmt.dict_ref(tag.value, pmt.intern("phase_est"), pmt.PMT_NIL)
-            if not pmt.is_null(phase_pmt):
-                phase_est = pmt.to_double(phase_pmt)
-        return phase_est
+    def forecast(self, noutput_items, ninputs):
+        return [self.max_packet_samples] * ninputs
 
     def _resolve_ambiguity(self, pre_iq):
-        rotations = self._rots
-        metric = [np.real(np.sum(pre_iq * np.conj(self.ref_preamble * rot))) for rot in rotations]
+        metric = [np.real(np.sum(pre_iq * np.conj(self.ref_preamble * rot))) for rot in self._rots]
         best_rot_idx = int(np.argmax(metric))
-        return best_rot_idx, rotations[best_rot_idx]
+        return best_rot_idx, self._rots[best_rot_idx]
 
+    def _estimate_cfo_and_phase(self, pre_iq):
+        """利用 Preamble 計算每個 Symbol 的相位偏差並做線性擬合 (y = a*x + b)"""
+        # 計算接收 Preamble 與參考 Preamble 的相位差
+        phase_diff = np.angle(pre_iq * np.conj(self.ref_preamble))
+        phase_unwrap = np.unwrap(phase_diff)
+
+        # 線性擬合：a 為每 Symbol 的相位旋轉量 (CFO)，b 為初始相位
+        x = np.arange(len(pre_iq))
+        cfo_per_sym, phase_init = np.polyfit(x, phase_unwrap, 1)
+        return cfo_per_sym, phase_init
+
+    def general_work(self, input_items, output_items):
+        # ... (前面 Tag 搜尋與長度檢查保持不變) ...
+
+        for t in corr_tags:
+            # ...
+            pre_iq = in_iq[pre_start:pre_end]
+
+            # A. 計算該幀的 CFO (a) 與 初始相位 (b)
+            cfo_per_sym, phase_init = self._estimate_cfo_and_phase(pre_iq)
+
+            # B. 針對 Header 區段進行動態相位與 CFO 補償
+            hdr_raw = in_iq[hdr_start:hdr_end]
+            t_hdr = np.arange(self.pre_len_syms, self.pre_len_syms + self.header_len_syms)
+            hdr_iq = hdr_raw * np.exp(-1j * (cfo_per_sym * t_hdr + phase_init))
+
+            hdr_syms = [self.qam16_const.decision_maker(s) for s in hdr_iq]
+            
+            header_bytes = []
+            for i in range(0, self.header_len_syms, 2):
+                byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
+                header_bytes.append(int(byte_val))
+
+            # Header Validation
+            if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
+                continue
+
+            # ... (Payload 邊界檢查保持不變) ...
+
+            # C. 針對 Payload 區段套用相同的 CFO 與相位補償
+            pay_raw = in_iq[pay_start:pay_end]
+            t_pay = np.arange(
+                self.pre_len_syms + self.header_len_syms, 
+                self.pre_len_syms + self.header_len_syms + total_payload_syms
+            )
+            pay_iq = pay_raw * np.exp(-1j * (cfo_per_sym * t_pay + phase_init))
+
+            out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
+            # ... (後續 Tag 新增與 pos 更新保持不變) ...
     def general_work(self, input_items, output_items):
         in_iq = input_items[0]
         out_iq = output_items[0]
-
-        n_in = len(in_iq)
+        
         n_out_avail = len(out_iq)
         if n_in == 0 or n_out_avail == 0:
             return 0
@@ -202,16 +232,15 @@ class qam16_header_strip_with_phase(gr.basic_block):
             return write_len
 
         in_pos = 0
-        out_pos = 0        
+        out_pos = 0    
+        print(f"tag num {len(tags)}")
         for t in corr_tags:
+            # 抑制距離過近的 Barker 副峰 Ghost Tag
+            if t.offset - self.last_processed_offset < (self.pre_len_syms + self.header_len_syms):
+                continue
+
             rel_idx = int(t.offset - n_read_abs)
 
-            # 找到 corr_start 後，直接印出 Tag 前後 50 個 symbol 的映射結果
-            test_iq = in_iq[rel_idx : rel_idx + 50]
-            test_syms = [self.qam16_const.decision_maker(s) for s in test_iq]
-            print(f"Tag @ {rel_idx}, raw symbols: {test_syms[:20]}")
-
-            # mark_delay = 0 時，rel_idx 指向 Preamble 的第一個 Symbol
             pre_start = rel_idx + 1
             pre_end = pre_start + self.pre_len_syms
             hdr_start = pre_end
@@ -223,11 +252,11 @@ class qam16_header_strip_with_phase(gr.basic_block):
             if pre_start < 0 or hdr_end > n_in:
                 break
 
-            phase_est = self._get_phase_est_from_tag(t)
-            pre_iq = in_iq[pre_start:pre_end] * np.exp(-1j * phase_est)
+            pre_iq = in_iq[pre_start:pre_end]
             best_rot_idx, best_rot = self._resolve_ambiguity(pre_iq)
 
-            hdr_iq = in_iq[hdr_start:hdr_end] * np.exp(-1j * phase_est) * np.conj(best_rot)
+            # 解旋轉 Header
+            hdr_iq = in_iq[hdr_start:hdr_end] * np.conj(best_rot)
             hdr_syms = [self.qam16_const.decision_maker(s) for s in hdr_iq]
             
             header_bytes = []
@@ -235,14 +264,16 @@ class qam16_header_strip_with_phase(gr.basic_block):
                 byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
                 header_bytes.append(int(byte_val))
 
-            print(f"header {[hex(b) for b in header_bytes]}")
-            
-            # Header Validation: [0x10, seq, payload_len, 0xAB]
+            # Header 格式合規檢驗: [0x10, seq, payload_len, 0xAB]
             if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
                 continue
 
             seq_num = int(header_bytes[1])
             payload_len = int(header_bytes[2])
+
+            # 邊界防護：防止異常長度造成內部 Buffer Stall
+            if payload_len > self.max_payload_bytes or payload_len == 0:
+                continue
 
             pay_start = hdr_end
             total_payload_syms = (payload_len + 2) * 2
@@ -259,15 +290,14 @@ class qam16_header_strip_with_phase(gr.basic_block):
                 out_iq[out_pos:out_pos+passthrough_len] = in_iq[in_pos:pre_start]
                 out_pos += passthrough_len
 
-            pay_iq = in_iq[pay_start:pay_end] * np.exp(-1j * phase_est) * np.conj(best_rot)
+            pay_iq = in_iq[pay_start:pay_end] * np.conj(best_rot)
             out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
 
             payload_start_out_abs = self.nitems_written(0) + out_pos
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("payload_len"), pmt.from_long(payload_len))
             self.add_item_tag(0, payload_start_out_abs, pmt.intern("seq_num"), pmt.from_long(seq_num))
-            self.add_item_tag(0, payload_start_out_abs, pmt.intern("phase_est"), pmt.from_double(phase_est))
-            self.add_item_tag(0, payload_start_out_abs, pmt.intern("ambiguity_idx"), pmt.from_long(best_rot_idx))
 
+            self.last_processed_offset = t.offset
             out_pos += len(pay_iq)
             in_pos = pay_end
 
@@ -298,7 +328,7 @@ class qam16_payload_demod(gr.sync_block):
 
         tags = self.get_tags_in_window(0, 0, n_in)
         n_read_abs = self.nitems_read(0)
-
+                
         for t in tags:
             if t.key == pmt.intern("payload_len"):
                 rel_idx = int(t.offset - n_read_abs)
@@ -336,7 +366,7 @@ class qam16_payload_demod(gr.sync_block):
         return n_in
 
 # ============================================================
-# 6. Rx Block
+# 6. Rx Block (Complete & Optimized DSP Chain)
 # ============================================================
 class rx_block(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
@@ -348,25 +378,23 @@ class rx_block(gr.hier_block2):
         )
 
         sym_rate = samp_rate // sps
-        ntaps    = 15 * sps + 1
-        rolloff  = 0.35
+        ntaps = 15 * sps + 1
+        self.const = QAM16_CONST
 
-        self.const = digital.constellation_16qam().base()
-
-        # 1. Matched Filter
+        # 1. Matched Filter (RRC Filter)
         rrc_taps = filter.firdes.root_raised_cosine(
             gain=1.0,
             sampling_freq=samp_rate,
             symbol_rate=sym_rate,
-            alpha=rolloff,
+            alpha=alpha,
             ntaps=ntaps,
         )
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
-        # 2. AGC
+        # 2. AGC (標竿參考功率設為 1.0)
         self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
 
-        # 3. Symbol Sync (Gardner)
+        # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
             digital.TED_GARDNER,
             sps,
@@ -379,31 +407,48 @@ class rx_block(gr.hier_block2):
             digital.IR_MMSE_8TAP,
         )
 
-        # 4. Correlation Estimator (mark_delay=0，標記於 Preamble 起始點 P[0])
+        # 4. Carrier Frequency & Phase Tracking (Costas Loop)
+        # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動
+        self.costas = digital.costas_loop_cc(
+            loop_bw=0.008,
+            order=4,
+            use_snr=False
+        )
+
+        # 5. Correlation Estimator (過濾邊界調高至 0.85 壓制副峰)
         preamble_symbols = np.array(QAM16_PREAMBLE_SYMBOLS, dtype=np.complex64)
         self.corr = digital.corr_est_cc(
             preamble_symbols.tolist(),
             sps=1,
             mark_delay=0,
-            threshold=0.8
+            threshold=0.85
         )
 
-        # 5. Header Strip & Ambiguity Resolver
+        # 6. Header Strip & Ambiguity Resolver
         self.header_strip = qam16_header_strip_with_phase(
             preamble_len_syms=len(QAM16_PREAMBLE_SYMBOLS),
             header_len_bytes=4,
             max_payload_bytes=256
         )
 
-        # 6. Payload Demodulator
+        # 7. Payload Demodulator
         self.demod = qam16_payload_demod()
 
         # GUI Sink
         self.copy = blocks.copy(gr.sizeof_gr_complex)
         self.qt_post = qtgui.const_sink_c(512, '16QAM Constellation', 1)
 
-        # 連線
-        self.connect(self, self.rrc_rx, self.agc, self.clock_sync, self.corr, self.header_strip, self.demod)
+        # DSP Chain 連線
+        self.connect(
+            self,
+            self.rrc_rx,
+            self.agc,
+            self.clock_sync,
+            self.costas,
+            self.corr,
+            self.header_strip,
+            self.demod
+        )
         self.connect(self.header_strip, self.copy, self.qt_post)
 
 # ============================================================
@@ -421,21 +466,19 @@ class top_gui(Qt.QWidget):
         self.tx = tx_block(sps, samp_rate, alpha)
         self.rx = rx_block(sps, samp_rate, alpha)
 
-        #isi_taps = [1.0 + 0.0j, 0.25 + 0.1j, 0.15 - 0.05j]
         isi_taps = [1.0 + 0.0j]
 
         self.channel = channels.channel_model(
-            noise_voltage=0.01,        # 高斯白雜訊 (AWGN)
-            frequency_offset=0.0000,   # 頻率偏差 (CFO)
-            epsilon=1.0,               # 採樣率偏差 (SFO)
-            taps=isi_taps,             # 【注入 ISI 通道響應】
+            noise_voltage=0.01,        # AWGN 雜訊
+            frequency_offset=0.0004,   # 頻率偏差 (CFO)
+            epsilon=1.0,
+            taps=isi_taps,             # ISI 響應
             noise_seed=42,
             block_tags=False
         )
 
         self.tb.connect(self.tx, self.channel)
         self.tb.connect(self.channel, self.rx)
-        #self.tb.connect(self.tx, self.rx)
 
         layout = Qt.QVBoxLayout()
         self.setLayout(layout)

@@ -8,7 +8,7 @@ import time
 from gnuradio import analog
 from gnuradio import blocks
 from gnuradio import digital
-from gnuradio import filter as grfilter
+from gnuradio import filter
 from gnuradio import gr
 from gnuradio import qtgui
 from gnuradio.filter import firdes
@@ -135,7 +135,7 @@ class tx_block(gr.hier_block2):
 
         self.pkt_gen = sequential_packet_gen(payload_len=8)
         rrc = firdes.root_raised_cosine(1.0, samp_rate, sym_rate, alpha, ntaps)
-        self.rrc = grfilter.interp_fir_filter_ccf(sps, rrc)
+        self.rrc = filter.interp_fir_filter_ccf(sps, rrc)
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
         self.connect(self.pkt_gen, self.rrc, self.throttle, self)
@@ -153,7 +153,6 @@ class qam16_header_strip_with_phase(gr.basic_block):
         )
         self.pre_len_syms = int(preamble_len_syms)
         self.header_len_bytes = int(header_len_bytes)
-        # 16QAM: 1 Byte = 2 Symbols
         self.header_len_syms = self.header_len_bytes * 2
         self.qam16_const = QAM16_CONST
         self.ref_preamble = np.array(QAM16_PREAMBLE_SYMBOLS, dtype=np.complex64)
@@ -201,20 +200,25 @@ class qam16_header_strip_with_phase(gr.basic_block):
             out_iq[:write_len] = in_iq[:write_len]
             self.consume(0, write_len)
             return write_len
-        #print(f"[Header Strip] Found {len(corr_tags)} correlation tags in window.")
+
         in_pos = 0
         out_pos = 0        
         for t in corr_tags:
             rel_idx = int(t.offset - n_read_abs)
 
-            if rel_idx < in_pos:
-                continue
+            # 找到 corr_start 後，直接印出 Tag 前後 50 個 symbol 的映射結果
+            test_iq = in_iq[rel_idx : rel_idx + 50]
+            test_syms = [self.qam16_const.decision_maker(s) for s in test_iq]
+            print(f"Tag @ {rel_idx}, raw symbols: {test_syms[:20]}")
 
-            # mark_delay 設為 preamble_len 時，tag 剛好指在 Preamble 後第一個位置
-            pre_start = rel_idx - self.pre_len_syms
-            pre_end = rel_idx
+            # mark_delay = 0 時，rel_idx 指向 Preamble 的第一個 Symbol
+            pre_start = rel_idx + 1
+            pre_end = pre_start + self.pre_len_syms
             hdr_start = pre_end
             hdr_end = hdr_start + self.header_len_syms
+
+            if pre_start < in_pos:
+                continue
 
             if pre_start < 0 or hdr_end > n_in:
                 break
@@ -231,7 +235,8 @@ class qam16_header_strip_with_phase(gr.basic_block):
                 byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
                 header_bytes.append(int(byte_val))
 
-            print([hex(b) for b in header_bytes])
+            print(f"header {[hex(b) for b in header_bytes]}")
+            
             # Header Validation: [0x10, seq, payload_len, 0xAB]
             if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
                 continue
@@ -247,7 +252,6 @@ class qam16_header_strip_with_phase(gr.basic_block):
                 break
 
             passthrough_len = pre_start - in_pos
-
             if out_pos + passthrough_len + total_payload_syms > n_out_avail:
                 break
 
@@ -266,21 +270,6 @@ class qam16_header_strip_with_phase(gr.basic_block):
 
             out_pos += len(pay_iq)
             in_pos = pay_end
-
-        next_tag_idx = n_in
-        for t in corr_tags:
-            r_idx = int(t.offset - n_read_abs)
-            if r_idx >= in_pos:
-                next_tag_idx = r_idx + 1
-                break
-
-        tail_passthrough = next_tag_idx - in_pos
-        if tail_passthrough > 0:
-            write_tail = min(tail_passthrough, n_out_avail - out_pos)
-            if write_tail > 0:
-                out_iq[out_pos:out_pos+write_tail] = in_iq[in_pos:in_pos+write_tail]
-                out_pos += write_tail
-                in_pos += write_tail
 
         if in_pos > 0:
             self.consume(0, in_pos)
@@ -315,7 +304,6 @@ class qam16_payload_demod(gr.sync_block):
                 rel_idx = int(t.offset - n_read_abs)
                 payload_len = pmt.to_long(t.value)
 
-                # 找同位置的 seq_num tag
                 seq_num = -1
                 for t_seq in tags:
                     if t_seq.key == pmt.intern("seq_num") and t_seq.offset == t.offset:
@@ -360,27 +348,43 @@ class rx_block(gr.hier_block2):
         )
 
         sym_rate = samp_rate // sps
-        ntaps = 15 * sps + 1
-        rrc = firdes.root_raised_cosine(1, samp_rate, sym_rate, alpha, ntaps)
+        ntaps    = 15 * sps + 1
+        rolloff  = 0.35
 
-        # 1. Symbol Sync (Gardner TED)
-        self.symbol_sync = digital.symbol_sync_cc(
-            digital.TED_GARDNER, sps, 0.01, 1.0, 1.0, 1.5, 1,
-            QAM16_CONST, digital.IR_MMSE_8TAP, 128, rrc
+        self.const = digital.constellation_16qam().base()
+
+        # 1. Matched Filter
+        rrc_taps = filter.firdes.root_raised_cosine(
+            gain=1.0,
+            sampling_freq=samp_rate,
+            symbol_rate=sym_rate,
+            alpha=rolloff,
+            ntaps=ntaps,
         )
+        self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
         # 2. AGC
-        self.agc = analog.agc2_cc(1e-2, 1e-3, 1.0, 1.0)
+        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
 
-        # 3. Costas Loop
-        self.costas = digital.costas_loop_cc(loop_bw=0.01, order=4, use_snr=False)
+        # 3. Symbol Sync (Gardner)
+        self.clock_sync = digital.symbol_sync_cc(
+            digital.TED_GARDNER,
+            sps,
+            0.001,
+            1.0,
+            1.0,
+            1.5,
+            1,
+            self.const,
+            digital.IR_MMSE_8TAP,
+        )
 
-        # 4. Correlation Estimator
+        # 4. Correlation Estimator (mark_delay=0，標記於 Preamble 起始點 P[0])
         preamble_symbols = np.array(QAM16_PREAMBLE_SYMBOLS, dtype=np.complex64)
         self.corr = digital.corr_est_cc(
             preamble_symbols.tolist(),
             sps=1,
-            mark_delay=len(QAM16_PREAMBLE_SYMBOLS),
+            mark_delay=0,
             threshold=0.8
         )
 
@@ -394,15 +398,13 @@ class rx_block(gr.hier_block2):
         # 6. Payload Demodulator
         self.demod = qam16_payload_demod()
 
+        # GUI Sink
+        self.copy = blocks.copy(gr.sizeof_gr_complex)
         self.qt_post = qtgui.const_sink_c(512, '16QAM Constellation', 1)
 
-        self.connect(self, self.symbol_sync)
-        self.connect(self.symbol_sync, self.agc)
-        self.connect(self.agc, self.costas)
-        self.connect(self.costas, self.corr)
-        self.connect(self.corr, self.header_strip)
-        self.connect(self.header_strip, self.demod)
-        self.connect(self.costas, self.qt_post)
+        # 連線
+        self.connect(self, self.rrc_rx, self.agc, self.clock_sync, self.corr, self.header_strip, self.demod)
+        self.connect(self.header_strip, self.copy, self.qt_post)
 
 # ============================================================
 # 7. GUI Top Block
@@ -419,18 +421,21 @@ class top_gui(Qt.QWidget):
         self.tx = tx_block(sps, samp_rate, alpha)
         self.rx = rx_block(sps, samp_rate, alpha)
 
-        #self.channel = channels.channel_model(
-        #    noise_voltage=0.005,
-        #    frequency_offset=0.0000,
-        #    epsilon=1.0,
-        #    taps=[1.0 + 0.0j],
-        #    noise_seed=42,
-        #    block_tags=False
-        #)
+        #isi_taps = [1.0 + 0.0j, 0.25 + 0.1j, 0.15 - 0.05j]
+        isi_taps = [1.0 + 0.0j]
 
-        #self.tb.connect(self.tx, self.channel)
-        #self.tb.connect(self.channel, self.rx)
-        self.tb.connect(self.tx, self.rx)
+        self.channel = channels.channel_model(
+            noise_voltage=0.01,        # 高斯白雜訊 (AWGN)
+            frequency_offset=0.0000,   # 頻率偏差 (CFO)
+            epsilon=1.0,               # 採樣率偏差 (SFO)
+            taps=isi_taps,             # 【注入 ISI 通道響應】
+            noise_seed=42,
+            block_tags=False
+        )
+
+        self.tb.connect(self.tx, self.channel)
+        self.tb.connect(self.channel, self.rx)
+        #self.tb.connect(self.tx, self.rx)
 
         layout = Qt.QVBoxLayout()
         self.setLayout(layout)

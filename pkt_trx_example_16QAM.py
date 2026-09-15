@@ -243,7 +243,7 @@ class qam16_header_strip_with_phase(gr.basic_block):
         out_pos = 0    
         #print(f"tag num {len(tags)}")
         for t in corr_tags:
-            #print(f"found header {t.offset}")
+            print(f"found header {t.offset}")
             # 抑制距離過近的 Barker 副峰 Ghost Tag
             if t.offset - self.last_processed_offset < (self.pre_len_syms + self.header_len_syms):
                 continue
@@ -281,12 +281,11 @@ class qam16_header_strip_with_phase(gr.basic_block):
             # Header 格式合規檢驗: [0x10, seq, payload_len, 0xAB]
             
             chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
-            #print(f"header {[hex(b) for b in header_bytes]} chk_sum: {hex(chk_sum)}")
+            print(f"header {[hex(b) for b in header_bytes]} chk_sum: {hex(chk_sum)}")
             
             #if header_bytes[0] != 0x10 or header_bytes[2] != 0x8:
             if header_bytes[3] != chk_sum:
-                print(f"check sum fail {hex(header_bytes[3])} != {hex(chk_sum)}\n");
-                print(f"header {[hex(b) for b in header_bytes]} chk_sum: {hex(chk_sum)}")
+                print(f"check sum fail {hex(header_bytes[3])} != {hex(chk_sum)}\n");                
                 continue
             
 
@@ -330,7 +329,7 @@ class qam16_header_strip_with_phase(gr.basic_block):
 
         if in_pos > 0:
             self.consume(0, in_pos)
-        #print(f"search done {in_pos} {out_pos}\n")
+        print(f"search done {in_pos} {out_pos}\n")
         return out_pos
 
 # ============================================================
@@ -423,7 +422,7 @@ class rx_block(gr.hier_block2):
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
-            digital.TED_GARDNER,
+            digital.TED_GARDNER  ,
             sps,
             0.001,
             1.0,
@@ -480,7 +479,7 @@ class rx_block(gr.hier_block2):
             self.throttle,
             self.demod
         )
-        self.connect(self.header_strip, self.copy, self.qt_post)
+        self.connect(self.costas, self.copy, self.qt_post)
 
 # ============================================================
 # 7. GUI Top Block
@@ -501,7 +500,7 @@ class top_gui(Qt.QWidget):
 
         self.channel = channels.channel_model(
             noise_voltage=0.00,        # AWGN 雜訊
-            frequency_offset=0.0000,   # 頻率偏差 (CFO)
+            frequency_offset=0.00004,   # 頻率偏差 (CFO)
             epsilon=1.0,
             taps=isi_taps,             # ISI 響應
             noise_seed=42,

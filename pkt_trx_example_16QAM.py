@@ -74,7 +74,13 @@ class sequential_packet_gen(gr.sync_block):
 
     def _generate_next_packet_symbols(self):
         payload_bytes = np.arange(0, self.payload_len, 1, dtype=np.uint8).tolist()
+        
+               
         header_bytes = [0x10, self.seq_num, self.payload_len, 0xAB]
+        chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
+        header_bytes[3] = chk_sum
+        #print(f"tx header {[hex(b) for b in header_bytes]}")
+
         crc_val = crc16_ibm(payload_bytes)
         crc_bytes = [(crc_val >> 8) & 0xFF, crc_val & 0xFF]
         
@@ -163,55 +169,56 @@ class qam16_header_strip_with_phase(gr.basic_block):
         best_rot_idx = int(np.argmax(metric))
         return best_rot_idx, self._rots[best_rot_idx]
 
-    def _estimate_cfo_and_phase(self, pre_iq):
-        """利用 Preamble 計算每個 Symbol 的相位偏差並做線性擬合 (y = a*x + b)"""
-        # 計算接收 Preamble 與參考 Preamble 的相位差
-        phase_diff = np.angle(pre_iq * np.conj(self.ref_preamble))
-        phase_unwrap = np.unwrap(phase_diff)
+    #def _estimate_cfo_and_phase(self, pre_iq):
+    #    """利用 Preamble 計算每個 Symbol 的相位偏差並做線性擬合 (y = a*x + b)"""
+    #    # 計算接收 Preamble 與參考 Preamble 的相位差
+    #    phase_diff = np.angle(pre_iq * np.conj(self.ref_preamble))
+    #    phase_unwrap = np.unwrap(phase_diff)
+    #
+    #    # 線性擬合：a 為每 Symbol 的相位旋轉量 (CFO)，b 為初始相位
+    #    x = np.arange(len(pre_iq))
+    #    cfo_per_sym, phase_init = np.polyfit(x, phase_unwrap, 1)
+    #    return cfo_per_sym, phase_init
 
-        # 線性擬合：a 為每 Symbol 的相位旋轉量 (CFO)，b 為初始相位
-        x = np.arange(len(pre_iq))
-        cfo_per_sym, phase_init = np.polyfit(x, phase_unwrap, 1)
-        return cfo_per_sym, phase_init
+    #def general_work(self, input_items, output_items):
+    #    # ... (前面 Tag 搜尋與長度檢查保持不變) ...
+    #
+    #    for t in corr_tags:
+    #        # ...
+    #        pre_iq = in_iq[pre_start:pre_end]
+    #
+    #        # A. 計算該幀的 CFO (a) 與 初始相位 (b)
+    #        cfo_per_sym, phase_init = self._estimate_cfo_and_phase(pre_iq)
+    #
+    #        # B. 針對 Header 區段進行動態相位與 CFO 補償
+    #        hdr_raw = in_iq[hdr_start:hdr_end]
+    #        t_hdr = np.arange(self.pre_len_syms, self.pre_len_syms + self.header_len_syms)
+    #        hdr_iq = hdr_raw * np.exp(-1j * (cfo_per_sym * t_hdr + phase_init))
+    #
+    #        hdr_syms = [self.qam16_const.decision_maker(s) for s in hdr_iq]
+    #        
+    #        header_bytes = []
+    #        for i in range(0, self.header_len_syms, 2):
+    #            byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
+    #            header_bytes.append(int(byte_val))
+    #
+    #        # Header Validation
+    #        if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
+    #            continue
+    #
+    #        # ... (Payload 邊界檢查保持不變) ...
+    #
+    #        # C. 針對 Payload 區段套用相同的 CFO 與相位補償
+    #        pay_raw = in_iq[pay_start:pay_end]
+    #        t_pay = np.arange(
+    #            self.pre_len_syms + self.header_len_syms, 
+    #            self.pre_len_syms + self.header_len_syms + total_payload_syms
+    #        )
+    #        pay_iq = pay_raw * np.exp(-1j * (cfo_per_sym * t_pay + phase_init))
+    #
+    #        out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
+    #        # ... (後續 Tag 新增與 pos 更新保持不變) ...
 
-    def general_work(self, input_items, output_items):
-        # ... (前面 Tag 搜尋與長度檢查保持不變) ...
-
-        for t in corr_tags:
-            # ...
-            pre_iq = in_iq[pre_start:pre_end]
-
-            # A. 計算該幀的 CFO (a) 與 初始相位 (b)
-            cfo_per_sym, phase_init = self._estimate_cfo_and_phase(pre_iq)
-
-            # B. 針對 Header 區段進行動態相位與 CFO 補償
-            hdr_raw = in_iq[hdr_start:hdr_end]
-            t_hdr = np.arange(self.pre_len_syms, self.pre_len_syms + self.header_len_syms)
-            hdr_iq = hdr_raw * np.exp(-1j * (cfo_per_sym * t_hdr + phase_init))
-
-            hdr_syms = [self.qam16_const.decision_maker(s) for s in hdr_iq]
-            
-            header_bytes = []
-            for i in range(0, self.header_len_syms, 2):
-                byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
-                header_bytes.append(int(byte_val))
-
-            # Header Validation
-            if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
-                continue
-
-            # ... (Payload 邊界檢查保持不變) ...
-
-            # C. 針對 Payload 區段套用相同的 CFO 與相位補償
-            pay_raw = in_iq[pay_start:pay_end]
-            t_pay = np.arange(
-                self.pre_len_syms + self.header_len_syms, 
-                self.pre_len_syms + self.header_len_syms + total_payload_syms
-            )
-            pay_iq = pay_raw * np.exp(-1j * (cfo_per_sym * t_pay + phase_init))
-
-            out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
-            # ... (後續 Tag 新增與 pos 更新保持不變) ...
     def general_work(self, input_items, output_items):
         in_iq = input_items[0]
         out_iq = output_items[0]
@@ -236,6 +243,7 @@ class qam16_header_strip_with_phase(gr.basic_block):
         out_pos = 0    
         #print(f"tag num {len(tags)}")
         for t in corr_tags:
+            #print(f"found header {t.offset}")
             # 抑制距離過近的 Barker 副峰 Ghost Tag
             if t.offset - self.last_processed_offset < (self.pre_len_syms + self.header_len_syms):
                 continue
@@ -247,11 +255,16 @@ class qam16_header_strip_with_phase(gr.basic_block):
             hdr_start = pre_end
             hdr_end = hdr_start + self.header_len_syms
 
+            #print(f"--->info1 pre_start:{pre_start} in_pos:{in_pos} hdr_end:{hdr_end} n_in:{n_in} t.offset:{t.offset}");
             if pre_start < in_pos:
+                print(f"check fail1 {pre_start} {in_pos}\n");
                 continue
 
             if pre_start < 0 or hdr_end > n_in:
+                print(f"check fail2 pre_start:{pre_start} hdr_end:{hdr_end} n_in:{n_in}\n");
                 break
+
+            in_pos = pre_end
 
             pre_iq = in_iq[pre_start:pre_end]
             best_rot_idx, best_rot = self._resolve_ambiguity(pre_iq)
@@ -266,14 +279,24 @@ class qam16_header_strip_with_phase(gr.basic_block):
                 header_bytes.append(int(byte_val))
 
             # Header 格式合規檢驗: [0x10, seq, payload_len, 0xAB]
-            if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
+            
+            chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
+            #print(f"header {[hex(b) for b in header_bytes]} chk_sum: {hex(chk_sum)}")
+            
+            #if header_bytes[0] != 0x10 or header_bytes[2] != 0x8:
+            if header_bytes[3] != chk_sum:
+                print(f"check sum fail {hex(header_bytes[3])} != {hex(chk_sum)}\n");
+                print(f"header {[hex(b) for b in header_bytes]} chk_sum: {hex(chk_sum)}")
                 continue
+            
 
             seq_num = int(header_bytes[1])
             payload_len = int(header_bytes[2])
+            #print(f"packet info seq_num: {seq_num} payload_len: {payload_len}")
 
             # 邊界防護：防止異常長度造成內部 Buffer Stall
             if payload_len > self.max_payload_bytes or payload_len == 0:
+                print(f"fail payload_len:{payload_len} self.max_payload_bytes:{self.max_payload_bytes} ")
                 continue
 
             pay_start = hdr_end
@@ -281,10 +304,12 @@ class qam16_header_strip_with_phase(gr.basic_block):
             pay_end = pay_start + total_payload_syms
 
             if pay_end > n_in:
+                print(f"fail pay_end:{pay_end} n_in:{n_in} ")
                 break
 
             passthrough_len = pre_start - in_pos
             if out_pos + passthrough_len + total_payload_syms > n_out_avail:
+                print(f"fail out_pos:{out_pos} passthrough_len:{passthrough_len} total_payload_syms:{total_payload_syms} n_out_avail:{n_out_avail}")
                 break
 
             if passthrough_len > 0:
@@ -301,10 +326,11 @@ class qam16_header_strip_with_phase(gr.basic_block):
             self.last_processed_offset = t.offset
             out_pos += len(pay_iq)
             in_pos = pay_end
+            #print(f"packet end in_pos:{in_pos} out_pos:{out_pos}\n")
 
         if in_pos > 0:
             self.consume(0, in_pos)
-
+        #print(f"search done {in_pos} {out_pos}\n")
         return out_pos
 
 # ============================================================
@@ -432,6 +458,9 @@ class rx_block(gr.hier_block2):
             max_payload_bytes=256
         )
 
+        self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate/sps, True)
+
+
         # 7. Payload Demodulator
         self.demod = qam16_payload_demod()
 
@@ -448,6 +477,7 @@ class rx_block(gr.hier_block2):
             self.costas,
             self.corr,
             self.header_strip,
+            self.throttle,
             self.demod
         )
         self.connect(self.header_strip, self.copy, self.qt_post)
@@ -470,8 +500,8 @@ class top_gui(Qt.QWidget):
         isi_taps = [1.0 + 0.0j]
 
         self.channel = channels.channel_model(
-            noise_voltage=0.01,        # AWGN 雜訊
-            frequency_offset=0.0004,   # 頻率偏差 (CFO)
+            noise_voltage=0.00,        # AWGN 雜訊
+            frequency_offset=0.0000,   # 頻率偏差 (CFO)
             epsilon=1.0,
             taps=isi_taps,             # ISI 響應
             noise_seed=42,

@@ -14,6 +14,7 @@ import sip
 from gnuradio import analog, blocks, digital, filter, gr, qtgui, channels
 from gnuradio.filter import firdes
 
+
 # ============================================================
 # CRC-16 (IBM)
 # ============================================================
@@ -34,13 +35,45 @@ def crc16_ibm(data_bytes):
 QAM16_CONST = digital.constellation_16qam().base()
 QAM16_POINTS = QAM16_CONST.points()
 
-BARKER_13_RAW = [1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1]
-BARKER_26_BITS = BARKER_13_RAW * 2
+#BARKER_13_RAW = [1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1]
+#BARKER_26_BITS = BARKER_13_RAW * 2
 
 def barker_to_16qam_symbols(barker_list):
-    return [QAM16_POINTS[0] if v == 1 else QAM16_POINTS[15] for v in barker_list]
+    return [QAM16_POINTS[2] if v == 1 else QAM16_POINTS[8] for v in barker_list]
 
-QAM16_PREAMBLE_SYMBOLS = barker_to_16qam_symbols(BARKER_26_BITS)
+#QAM16_PREAMBLE_SYMBOLS = barker_to_16qam_symbols(BARKER_26_BITS)
+#preamble = QAM16_PREAMBLE_SYMBOLS
+
+preamble = np.array([
+    0.316+0.316j,
+    0.948+0.316j,
+    0.316+0.948j,
+    -0.316+0.316j,
+    -0.948+0.316j,
+    -0.316+0.948j,
+    0.948+0.948j,
+    -0.948+0.948j,      
+
+], dtype=np.complex64)
+
+QAM16_PREAMBLE_SYMBOLS = preamble
+
+
+
+RX_SEARCH_PREAMBLE = 0
+RX_HEADER_PHASE    = 1
+RX_PAYLOAD         = 2
+
+HEADER_BYTES    = 4
+HEADER_SYMBOLS  = HEADER_BYTES*2
+
+PAYLOAD_BYTES    = 8
+PAYLOAD_SYMBOL   = PAYLOAD_BYTES*2
+
+
+PRE_LEN  = len(QAM16_PREAMBLE_SYMBOLS)   # 你的 preamble 長度
+
+
 PHASE_ROTATIONS = [1+0j, 0+1j, -1+0j, 0-1j]
 
 # ============================================================
@@ -76,7 +109,7 @@ class sequential_packet_gen(gr.sync_block):
         payload_bytes = np.arange(0, self.payload_len, 1, dtype=np.uint8).tolist()
         
                
-        header_bytes = [0x10, self.seq_num, self.payload_len, 0xAB]
+        header_bytes = [0x10, self.seq_num, self.payload_len, 0x00]
         chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
         header_bytes[3] = chk_sum
         #print(f"tx header {[hex(b) for b in header_bytes]}")
@@ -106,8 +139,21 @@ class sequential_packet_gen(gr.sync_block):
         out = output_items[0]
         n_out = len(out)
 
+        nwrite = self.nitems_written(0)
+
         while len(self.buffer) < n_out:
             new_frame = self._generate_next_packet_symbols()
+
+            # preamble 起始位置（在 new_frame 裡）
+            pre_start = len(self.dummy_syms)  # dummy_syms 之後就是 preamble
+            # 在 TX 端加 tag：preamble_start
+            self.add_item_tag(
+                                0,
+                                nwrite + len(self.buffer) + pre_start,
+                                pmt.intern("preamble_start"),
+                                pmt.from_long(self.seq_num)
+                            )
+
             self.buffer = np.concatenate((self.buffer, new_frame))
 
         out[:] = self.buffer[:n_out]
@@ -129,16 +175,331 @@ class tx_block(gr.hier_block2):
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
 
-        self.pkt_gen = sequential_packet_gen(payload_len=8)
+        self.pkt_gen = sequential_packet_gen(payload_len=PAYLOAD_BYTES)
         rrc = firdes.root_raised_cosine(1.0, samp_rate, sym_rate, alpha, ntaps)
         self.rrc = filter.interp_fir_filter_ccf(sps, rrc)
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
         self.connect(self.pkt_gen, self.rrc, self.throttle, self)
 
-# ============================================================
-# 4. Header Strip & Ambiguity Resolution Block
-# ============================================================
+
+class preamble_detector_cc(gr.sync_block):
+    def __init__(self, preamble_syms):
+        gr.sync_block.__init__(
+            self,
+            name="preamble_detector_cc",
+            in_sig=[np.complex64],
+            out_sig=[np.complex64],
+        )
+
+        # 參考 preamble（理想 16QAM 符號）
+        self.ref = np.array(preamble_syms, dtype=np.complex64)
+        self.pre_len = len(self.ref)
+
+        # 象限候選（0, 90, 180, 270 度）
+        self.candidates = [0, np.pi/2, np.pi, 3*np.pi/2]
+
+        # 跨區塊的歷史緩衝與邊界狀態
+        self.history = np.array([], dtype=np.complex64)
+        self.last_mag = 0.0
+        self.threshold = 0.85  # 可根據通道雜訊調整的門檻值
+
+    def _resolve_phase(self, rx_pre):
+        best_phi = None
+        best_dist = 1e99
+
+        for phi in self.candidates:
+            rotated = rx_pre * np.exp(-1j * phi)
+            dist = np.sum(np.abs(rotated - self.ref)**2)
+
+            if dist < best_dist:
+                best_dist = dist
+                best_phi = phi
+
+        return best_phi, best_dist
+
+    def work(self, input_items, output_items):
+        inp = input_items[0]
+        out = output_items[0]
+        n = len(inp)
+
+        nread  = self.nitems_read(0)
+        nwrite = self.nitems_written(0)
+
+        # 1. 結合歷史資料與當前輸入，計算所有點的 Normalized Correlation
+        full_data = np.concatenate([self.history, inp])
+        
+        mags = np.zeros(n, dtype=np.float32)
+        phases = np.zeros(n, dtype=np.float32)
+        ref_norm = np.linalg.norm(self.ref)
+
+        for i in range(n):
+            # 取出以當前索引為結尾的滑動視窗
+            window = full_data[i : i + self.pre_len]
+            if len(window) < self.pre_len:
+                continue
+
+            # 計算 normalized correlation
+            c = np.vdot(window, self.ref)
+            denom = np.linalg.norm(window) * ref_norm + 1e-12
+            c_norm = c / denom
+            mag = np.abs(c_norm)
+            mags[i] = mag
+
+            # 若高於粗檢門檻，預先計算該點的相位解算
+            if mag > 0.7:
+                best_phi, _ = self._resolve_phase(window)
+                phases[i] = best_phi
+            else:
+                phases[i] = 0.0
+
+        # 2. 檢查 Threshold 與 Local Maximum，判定真正的 preamble 起點
+        for i in range(n):
+            if mags[i] < self.threshold:
+                continue
+
+            # 取得左右鄰居數值以判斷 Local Maximum
+            left_val = self.last_mag if i == 0 else mags[i - 1]
+            right_val = 0.0 if i == n - 1 else mags[i + 1]
+
+            # 滿足大於門檻且為區域最大值（大於或等於兩側）
+            if mags[i] >= left_val and mags[i] >= right_val:
+                best_phi = phases[i]
+                pre_start = nwrite + i 
+
+                # 打上精準對齊的 preamble_match Tag
+                self.add_item_tag(
+                    0,
+                    pre_start,
+                    pmt.intern("preamble_match"),                            
+                    pmt.from_double(best_phi)
+                )
+                #print(f"[PRE DET] Local Max Hit at abs_idx={pre_start}, mag={mags[i]:.4f}, phi={best_phi}")
+
+        # 3. 更新下一個 block 所需的歷史記錄與邊界狀態
+        if n >= self.pre_len - 1:
+            self.history = inp[-(self.pre_len - 1):]
+        else:
+            self.history = full_data[-(self.pre_len - 1):]
+        
+        if n > 0:
+            self.last_mag = mags[-1]
+
+        out[:] = inp
+        return n
+
+
+class packet_parsing_old(gr.sync_block):
+    def __init__(self):
+        gr.sync_block.__init__(
+            self,
+            name="packet_parsing",
+            in_sig=[np.complex64],
+            out_sig=None
+        )
+
+        self.state = RX_SEARCH_PREAMBLE
+        self.buf = []
+        self.phase = 0
+        self.data_count = 0
+
+    def work(self, input_items, output_items):
+        inp = input_items[0]        
+        n = len(inp)
+        nread = self.nitems_read(0)
+
+        tags = self.get_tags_in_window(0, 0, n)
+        # print(f"tags = {len(tags)}")
+
+        tx_tags_list = []
+        rx_tags_list = []
+        for tag in tags:
+            if tag.key == pmt.intern("preamble_start"):
+                local_idx = tag.offset - nread
+                seq = pmt.to_long(tag.value)
+                local_tag = {'idx':local_idx,'tag_save':tag}
+                tx_tags_list.append(local_tag)
+                # print(f"[RX] TX preamble_start at tag_offset={tag.offset}, seq={seq}")
+
+            if tag.key == pmt.intern("preamble_match"):
+                local_idx = tag.offset - nread
+                local_tag = {'idx':local_idx,'tag_save':tag}
+                rx_tags_list.append(local_tag)               
+                # print(f"[RX] RX preamble_match at tag_offset={tag.offset}")
+            
+        if len(tx_tags_list) != 0:
+            tx_preamble_tag = tx_tags_list.pop(0)
+        else:
+            tx_preamble_tag = None
+
+        if len(rx_tags_list) != 0:
+            rx_preamble_tag = rx_tags_list.pop(0)
+        else:
+            rx_preamble_tag = None
+
+        for i in range(n):
+            s = inp[i]
+            if tx_preamble_tag != None:
+                if i == tx_preamble_tag['idx']:
+                    # print(f"PARISNG> {s} with preamble start at {tx_preamble_tag['idx']}, with index {nread+i}")
+                    if len(tx_tags_list) != 0:
+                        tx_preamble_tag = tx_tags_list.pop(0)
+                    else:
+                        tx_preamble_tag = None
+                
+            if rx_preamble_tag != None:
+                if i == rx_preamble_tag['idx']:
+                    # 1. 取得當前 match 帶有的相位
+                    self.phase = pmt.to_python(rx_preamble_tag['tag_save'].value)
+                    end = rx_preamble_tag['idx'] 
+                    start = end - PRE_LEN
+                    
+                    # 2. 關鍵修正：將取出的 Preamble 區段「乘上旋轉項」進行解旋轉
+                    preamble_rx = inp[start:end] * np.exp(-1j * self.phase)         
+
+                    print(f"\n[PREAMBLE_RX] match at idx={rx_preamble_tag['idx']}, global_idx={nread+i}, phase={self.phase:.4f}")
+                    print(f"  -> Rotated RX Preamble: {preamble_rx}")
+                    print(f"  -> Reference Preamble:  {preamble}")
+                    
+                    if len(rx_tags_list) != 0:
+                        rx_preamble_tag = rx_tags_list.pop(0)
+                    else:
+                        rx_preamble_tag = None
+              
+            # 後續的符號同步進行相位修正
+            s_corrected = s * np.exp(-1j * self.phase)                        
+            # print(f"PARISNG> {s_corrected} with index {nread+i}")
+
+        self.consume(0, n)            
+
+        return 0
+
+class packet_parsing(gr.sync_block):
+    def __init__(self):
+        gr.sync_block.__init__(
+            self,
+            name="packet_parsing",
+            in_sig=[np.complex64],
+            out_sig=None
+        )
+
+        # 定義狀態常數
+        self.RX_SEARCH_PREAMBLE = 0
+        self.RX_HEADER_PHASE     = 1
+        self.RX_PAYLOAD          = 2
+
+        self.state = self.RX_SEARCH_PREAMBLE
+        self.phase = 0.0
+        
+        # 收集暫存與計數
+        self.header_syms_needed = HEADER_BYTES * 2  # 每個 Byte 佔 2 個 16QAM Symbols (Nibbles)
+        self.payload_syms_needed = 0
+        self.current_seq = 0
+        self.current_payload_len = 0
+        self.collected_syms = []
+
+        self.qam16_const = QAM16_CONST
+
+    def work(self, input_items, output_items):
+        inp = input_items[0]        
+        n = len(inp)
+        nread = self.nitems_read(0)
+
+        # 檢索當前 Window 內的 Tags
+        tags = self.get_tags_in_window(0, 0, n)
+        rx_tags_dict = {int(t.offset - nread): t for t in tags if t.key == pmt.intern("preamble_match")}
+
+        for i in range(n):
+            s = inp[i]
+            abs_idx = nread + i
+
+            # ----------------------------------------------------
+            # 狀態 1：搜尋 Preamble
+            # ----------------------------------------------------
+            if self.state == self.RX_SEARCH_PREAMBLE:
+                if i in rx_tags_dict:
+                    tag = rx_tags_dict[i]
+                    self.phase = pmt.to_python(tag.value)
+                    
+                    # 驗證 Preamble 對齊（可選）
+                    start = i - PRE_LEN
+                    if start >= 0:
+                        preamble_rx = inp[start:i] * np.exp(-1j * self.phase)
+                        #print(f"\n[RX State] Preamble Matched at idx={i}, phase={self.phase:.4f}")
+                        #print(f"preamble_rx ={preamble_rx}")
+                        #print(f"preamble_ref={preamble}")
+
+                    # 進入 Header 收集狀態
+                    self.state = self.RX_HEADER_PHASE
+                    self.collected_syms = []
+                continue
+
+            # 對後續所有訊號進行即時相位修正
+            s_corrected = s * np.exp(-1j * self.phase)
+
+            # ----------------------------------------------------
+            # 狀態 2：收集與解析 Header (4 Bytes = 8 Symbols)
+            # ----------------------------------------------------
+            if self.state == self.RX_HEADER_PHASE:
+                self.collected_syms.append(s_corrected)
+                
+                if len(self.collected_syms) == self.header_syms_needed:
+                    # 進行星座圖判決 (Decision Maker)
+                    hard_syms = [self.qam16_const.decision_maker(sym) for sym in self.collected_syms]
+                    
+                    # 將 Nibbles 組裝回 Bytes: [0x10, seq, payload_len, checksum]
+                    header_bytes = []
+                    for k in range(0, len(hard_syms), 2):
+                        b_val = ((int(hard_syms[k]) & 0x0F) << 4) | (int(hard_syms[k+1]) & 0x0F)
+                        header_bytes.append(int(b_val))
+                    #print(f"header_bytes {[hex(_b) for _b in header_bytes]}")
+                    # 檢查 Checksum
+                    chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
+                    if header_bytes[3] == chk_sum:
+                        self.current_seq = header_bytes[1]
+                        self.current_payload_len = header_bytes[2]
+                        
+                        print(f"[RX Header] PASS | Seq: {self.current_seq}, Payload Len: {self.current_payload_len}")
+                        
+                        # 準備進入 Payload 階段 (Payload + 2 Bytes CRC)
+                        self.state = self.RX_PAYLOAD
+                        self.payload_syms_needed = (self.current_payload_len + 2) * 2
+                        self.collected_syms = []
+                    else:
+                        print(f"[RX Header] FAIL | Checksum mismatch: {hex(header_bytes[3])} != {hex(chk_sum)}")
+                        # 失敗則重置回搜尋狀態
+                        self.state = self.RX_SEARCH_PREAMBLE
+                        self.collected_syms = []
+
+            # ----------------------------------------------------
+            # 狀態 3：收集 Payload 與 CRC 檢查
+            # ----------------------------------------------------
+            elif self.state == self.RX_PAYLOAD:
+                self.collected_syms.append(s_corrected)
+
+                if len(self.collected_syms) == self.payload_syms_needed:
+                    hard_syms = [self.qam16_const.decision_maker(sym) for sym in self.collected_syms]
+
+                    bytes_out = []
+                    for k in range(0, len(hard_syms) - 1, 2):
+                        bytes_out.append(((hard_syms[k] & 0x0F) << 4) | (hard_syms[k+1] & 0x0F))
+
+                    payload = bytes_out[:self.current_payload_len]
+                    crc_rx = (bytes_out[self.current_payload_len] << 8) | bytes_out[self.current_payload_len + 1]
+                    crc_calc = crc16_ibm(payload)
+
+                    if crc_rx == crc_calc:
+                        print(f"[RX Payload] SUCCESS 🎉 | Seq #{self.current_seq} | Data: {payload}")
+                    else:
+                        print(f"[RX Payload] CRC ERROR ❌ | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)}")
+
+                    # 處理完一個封包後，回到初始狀態繼續尋找下一個 Preamble
+                    self.state = self.RX_SEARCH_PREAMBLE
+                    self.collected_syms = []
+
+        self.consume(0, n)            
+        return 0
+
 class qam16_header_strip_with_phase(gr.basic_block):
     def __init__(self, preamble_len_syms, header_len_bytes=4, max_payload_bytes=256):
         gr.basic_block.__init__(
@@ -161,6 +522,12 @@ class qam16_header_strip_with_phase(gr.basic_block):
 
         self.last_processed_offset = -1000
 
+        self.state = RX_SEARCH_PREAMBLE
+        self.buf = []
+        self.phase = 0
+        self.data_count = 0
+
+
     def forecast(self, noutput_items, ninputs):
         return [self.max_packet_samples] * ninputs
 
@@ -168,57 +535,7 @@ class qam16_header_strip_with_phase(gr.basic_block):
         metric = [np.real(np.sum(pre_iq * np.conj(self.ref_preamble * rot))) for rot in self._rots]
         best_rot_idx = int(np.argmax(metric))
         return best_rot_idx, self._rots[best_rot_idx]
-
-    #def _estimate_cfo_and_phase(self, pre_iq):
-    #    """利用 Preamble 計算每個 Symbol 的相位偏差並做線性擬合 (y = a*x + b)"""
-    #    # 計算接收 Preamble 與參考 Preamble 的相位差
-    #    phase_diff = np.angle(pre_iq * np.conj(self.ref_preamble))
-    #    phase_unwrap = np.unwrap(phase_diff)
-    #
-    #    # 線性擬合：a 為每 Symbol 的相位旋轉量 (CFO)，b 為初始相位
-    #    x = np.arange(len(pre_iq))
-    #    cfo_per_sym, phase_init = np.polyfit(x, phase_unwrap, 1)
-    #    return cfo_per_sym, phase_init
-
-    #def general_work(self, input_items, output_items):
-    #    # ... (前面 Tag 搜尋與長度檢查保持不變) ...
-    #
-    #    for t in corr_tags:
-    #        # ...
-    #        pre_iq = in_iq[pre_start:pre_end]
-    #
-    #        # A. 計算該幀的 CFO (a) 與 初始相位 (b)
-    #        cfo_per_sym, phase_init = self._estimate_cfo_and_phase(pre_iq)
-    #
-    #        # B. 針對 Header 區段進行動態相位與 CFO 補償
-    #        hdr_raw = in_iq[hdr_start:hdr_end]
-    #        t_hdr = np.arange(self.pre_len_syms, self.pre_len_syms + self.header_len_syms)
-    #        hdr_iq = hdr_raw * np.exp(-1j * (cfo_per_sym * t_hdr + phase_init))
-    #
-    #        hdr_syms = [self.qam16_const.decision_maker(s) for s in hdr_iq]
-    #        
-    #        header_bytes = []
-    #        for i in range(0, self.header_len_syms, 2):
-    #            byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
-    #            header_bytes.append(int(byte_val))
-    #
-    #        # Header Validation
-    #        if header_bytes[0] != 0x10 or header_bytes[3] != 0xAB:
-    #            continue
-    #
-    #        # ... (Payload 邊界檢查保持不變) ...
-    #
-    #        # C. 針對 Payload 區段套用相同的 CFO 與相位補償
-    #        pay_raw = in_iq[pay_start:pay_end]
-    #        t_pay = np.arange(
-    #            self.pre_len_syms + self.header_len_syms, 
-    #            self.pre_len_syms + self.header_len_syms + total_payload_syms
-    #        )
-    #        pay_iq = pay_raw * np.exp(-1j * (cfo_per_sym * t_pay + phase_init))
-    #
-    #        out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
-    #        # ... (後續 Tag 新增與 pos 更新保持不變) ...
-
+    
     def general_work(self, input_items, output_items):
         in_iq = input_items[0]
         out_iq = output_items[0]
@@ -409,7 +726,7 @@ class rx_block(gr.hier_block2):
 
         # 1. Matched Filter (RRC Filter)
         rrc_taps = filter.firdes.root_raised_cosine(
-            gain=1.0,
+            gain=sps,
             sampling_freq=samp_rate,
             symbol_rate=sym_rate,
             alpha=alpha,
@@ -418,11 +735,11 @@ class rx_block(gr.hier_block2):
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
         # 2. AGC (標竿參考功率設為 1.0)
-        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+        #self.agc = analog.agc2_cc(1e-4, 1e-5, 1.0, 1.0)
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
-            digital.TED_GARDNER  ,
+            digital.TED_GARDNER          ,
             sps,
             0.001,
             1.0,
@@ -433,35 +750,40 @@ class rx_block(gr.hier_block2):
             digital.IR_MMSE_8TAP,
         )
 
+        
+
         # 4. Carrier Frequency & Phase Tracking (Costas Loop)
         # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動
+        
         self.costas = digital.costas_loop_cc(
             loop_bw=0.008,
             order=4,
             use_snr=False
         )
 
-        # 5. Correlation Estimator (過濾邊界調高至 0.85 壓制副峰)
-        preamble_symbols = np.array(QAM16_PREAMBLE_SYMBOLS, dtype=np.complex64)
-        self.corr = digital.corr_est_cc(
-            preamble_symbols.tolist(),
-            sps=1,
-            mark_delay=0,
-            threshold=0.85
-        )
-
+        self.preamble_det = preamble_detector_cc(QAM16_PREAMBLE_SYMBOLS)
+        
         # 6. Header Strip & Ambiguity Resolver
-        self.header_strip = qam16_header_strip_with_phase(
-            preamble_len_syms=len(QAM16_PREAMBLE_SYMBOLS),
-            header_len_bytes=4,
-            max_payload_bytes=256
-        )
+        #self.header_strip = qam16_header_strip_with_phase(
+        #    preamble_len_syms=len(QAM16_PREAMBLE_SYMBOLS),
+        #    header_len_bytes=4,
+        #    max_payload_bytes=256
+        #)
+
 
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate/sps, True)
 
+        #self.constellation_rec = digital.constellation_receiver_cb(
+        #    constellation=self.const,
+        #    loop_bw=0.02,
+        #    fmin=-0.05,
+        #    fmax=0.05
+        #)
+
+        self.pkt_parsing = packet_parsing()
 
         # 7. Payload Demodulator
-        self.demod = qam16_payload_demod()
+        #self.demod = qam16_payload_demod()
 
         # GUI Sink
         self.copy = blocks.copy(gr.sizeof_gr_complex)
@@ -469,17 +791,18 @@ class rx_block(gr.hier_block2):
 
         # DSP Chain 連線
         self.connect(
-            self,
-            self.rrc_rx,
-            self.agc,
-            self.clock_sync,
-            self.costas,
-            self.corr,
-            self.header_strip,
-            self.throttle,
-            self.demod
-        )
-        self.connect(self.costas, self.copy, self.qt_post)
+                     self,
+                     self.rrc_rx,
+                     self.clock_sync,      # 先鎖 timing                     
+                     self.costas,
+                     self.preamble_det,    # 在 Costas 之前做 preamble + phase 解旋
+                     self.copy,
+                     self.throttle,
+                     self.pkt_parsing,
+                    )
+
+
+        self.connect(self.copy, self.qt_post)
 
 # ============================================================
 # 7. GUI Top Block
@@ -499,8 +822,8 @@ class top_gui(Qt.QWidget):
         isi_taps = [1.0 + 0.0j]
 
         self.channel = channels.channel_model(
-            noise_voltage=0.00,        # AWGN 雜訊
-            frequency_offset=0.00004,   # 頻率偏差 (CFO)
+            noise_voltage=0.002,        # AWGN 雜訊
+            frequency_offset=0.0002,   # 頻率偏差 (CFO)
             epsilon=1.0,
             taps=isi_taps,             # ISI 響應
             noise_seed=42,

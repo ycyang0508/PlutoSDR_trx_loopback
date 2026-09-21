@@ -80,14 +80,16 @@ PHASE_ROTATIONS = [1+0j, 0+1j, -1+0j, 0-1j]
 # 2. Sequential Packet Generator
 # ============================================================
 class sequential_packet_gen(gr.sync_block):
-    def __init__(self, payload_len=8):
+    def __init__(self, min_payload_len=4, max_payload_len=32):
         gr.sync_block.__init__(
             self,
             name="sequential_packet_gen",
             in_sig=None,
             out_sig=[np.complex64]
         )
-        self.payload_len = payload_len
+        self.min_payload_len = min_payload_len
+        self.max_payload_len = max_payload_len
+        #self.payload_len = payload_len
         self.seq_num = 0
         self.buffer = np.array([], dtype=np.complex64)
 
@@ -106,8 +108,9 @@ class sequential_packet_gen(gr.sync_block):
         return [self.reordered_points[n & 0x0F] for n in nibble_list]
 
     def _generate_next_packet_symbols(self):
+        #payload_bytes = np.arange(0, self.payload_len, 1, dtype=np.uint8).tolist()
+        self.payload_len = np.random.randint(self.min_payload_len, self.max_payload_len + 1)
         payload_bytes = np.arange(0, self.payload_len, 1, dtype=np.uint8).tolist()
-        
                
         header_bytes = [0x10, self.seq_num, self.payload_len, 0x00]
         chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
@@ -175,7 +178,7 @@ class tx_block(gr.hier_block2):
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
 
-        self.pkt_gen = sequential_packet_gen(payload_len=PAYLOAD_BYTES)
+        self.pkt_gen = sequential_packet_gen(min_payload_len=PAYLOAD_BYTES,max_payload_len=PAYLOAD_BYTES*2)
         rrc = firdes.root_raised_cosine(1.0, samp_rate, sym_rate, alpha, ntaps)
         self.rrc = filter.interp_fir_filter_ccf(sps, rrc)
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
@@ -287,92 +290,6 @@ class preamble_detector_cc(gr.sync_block):
 
         out[:] = inp
         return n
-
-
-class packet_parsing_old(gr.sync_block):
-    def __init__(self):
-        gr.sync_block.__init__(
-            self,
-            name="packet_parsing",
-            in_sig=[np.complex64],
-            out_sig=None
-        )
-
-        self.state = RX_SEARCH_PREAMBLE
-        self.buf = []
-        self.phase = 0
-        self.data_count = 0
-
-    def work(self, input_items, output_items):
-        inp = input_items[0]        
-        n = len(inp)
-        nread = self.nitems_read(0)
-
-        tags = self.get_tags_in_window(0, 0, n)
-        # print(f"tags = {len(tags)}")
-
-        tx_tags_list = []
-        rx_tags_list = []
-        for tag in tags:
-            if tag.key == pmt.intern("preamble_start"):
-                local_idx = tag.offset - nread
-                seq = pmt.to_long(tag.value)
-                local_tag = {'idx':local_idx,'tag_save':tag}
-                tx_tags_list.append(local_tag)
-                # print(f"[RX] TX preamble_start at tag_offset={tag.offset}, seq={seq}")
-
-            if tag.key == pmt.intern("preamble_match"):
-                local_idx = tag.offset - nread
-                local_tag = {'idx':local_idx,'tag_save':tag}
-                rx_tags_list.append(local_tag)               
-                # print(f"[RX] RX preamble_match at tag_offset={tag.offset}")
-            
-        if len(tx_tags_list) != 0:
-            tx_preamble_tag = tx_tags_list.pop(0)
-        else:
-            tx_preamble_tag = None
-
-        if len(rx_tags_list) != 0:
-            rx_preamble_tag = rx_tags_list.pop(0)
-        else:
-            rx_preamble_tag = None
-
-        for i in range(n):
-            s = inp[i]
-            if tx_preamble_tag != None:
-                if i == tx_preamble_tag['idx']:
-                    # print(f"PARISNG> {s} with preamble start at {tx_preamble_tag['idx']}, with index {nread+i}")
-                    if len(tx_tags_list) != 0:
-                        tx_preamble_tag = tx_tags_list.pop(0)
-                    else:
-                        tx_preamble_tag = None
-                
-            if rx_preamble_tag != None:
-                if i == rx_preamble_tag['idx']:
-                    # 1. 取得當前 match 帶有的相位
-                    self.phase = pmt.to_python(rx_preamble_tag['tag_save'].value)
-                    end = rx_preamble_tag['idx'] 
-                    start = end - PRE_LEN
-                    
-                    # 2. 關鍵修正：將取出的 Preamble 區段「乘上旋轉項」進行解旋轉
-                    preamble_rx = inp[start:end] * np.exp(-1j * self.phase)         
-
-                    print(f"\n[PREAMBLE_RX] match at idx={rx_preamble_tag['idx']}, global_idx={nread+i}, phase={self.phase:.4f}")
-                    print(f"  -> Rotated RX Preamble: {preamble_rx}")
-                    print(f"  -> Reference Preamble:  {preamble}")
-                    
-                    if len(rx_tags_list) != 0:
-                        rx_preamble_tag = rx_tags_list.pop(0)
-                    else:
-                        rx_preamble_tag = None
-              
-            # 後續的符號同步進行相位修正
-            s_corrected = s * np.exp(-1j * self.phase)                        
-            # print(f"PARISNG> {s_corrected} with index {nread+i}")
-
-        self.consume(0, n)            
-
-        return 0
 
 class packet_parsing(gr.sync_block):
     def __init__(self):
@@ -500,213 +417,10 @@ class packet_parsing(gr.sync_block):
         self.consume(0, n)            
         return 0
 
-class qam16_header_strip_with_phase(gr.basic_block):
-    def __init__(self, preamble_len_syms, header_len_bytes=4, max_payload_bytes=256):
-        gr.basic_block.__init__(
-            self,
-            name="qam16_header_strip_with_phase",
-            in_sig=[np.complex64],
-            out_sig=[np.complex64]
-        )
-        self.pre_len_syms = int(preamble_len_syms)
-        self.header_len_bytes = int(header_len_bytes)
-        self.header_len_syms = self.header_len_bytes * 2
-        self.qam16_const = QAM16_CONST
-        self.ref_preamble = np.array(QAM16_PREAMBLE_SYMBOLS, dtype=np.complex64)
-        self._rots = PHASE_ROTATIONS
-
-        self.max_payload_bytes = int(max_payload_bytes)
-        self.max_payload_syms = (self.max_payload_bytes + 2) * 2
-        self.max_packet_samples = 1 + self.pre_len_syms + self.header_len_syms + self.max_payload_syms
-        self.set_output_multiple(self.max_packet_samples)
-
-        self.last_processed_offset = -1000
-
-        self.state = RX_SEARCH_PREAMBLE
-        self.buf = []
-        self.phase = 0
-        self.data_count = 0
-
-
-    def forecast(self, noutput_items, ninputs):
-        return [self.max_packet_samples] * ninputs
-
-    def _resolve_ambiguity(self, pre_iq):
-        metric = [np.real(np.sum(pre_iq * np.conj(self.ref_preamble * rot))) for rot in self._rots]
-        best_rot_idx = int(np.argmax(metric))
-        return best_rot_idx, self._rots[best_rot_idx]
-    
-    def general_work(self, input_items, output_items):
-        in_iq = input_items[0]
-        out_iq = output_items[0]
-
-        n_in = len(in_iq)
-        n_out_avail = len(out_iq)
-        if n_in == 0 or n_out_avail == 0:
-            return 0
-
-        tags = self.get_tags_in_window(0, 0, n_in)
-        corr_tags = [t for t in tags if t.key == pmt.intern("corr_start")]
-        corr_tags.sort(key=lambda x: int(x.offset))
-
-        n_read_abs = self.nitems_read(0)
-        if not corr_tags:
-            write_len = min(n_in, n_out_avail)
-            out_iq[:write_len] = in_iq[:write_len]
-            self.consume(0, write_len)
-            return write_len
-
-        in_pos = 0
-        out_pos = 0    
-        #print(f"tag num {len(tags)}")
-        for t in corr_tags:
-            print(f"found header {t.offset}")
-            # 抑制距離過近的 Barker 副峰 Ghost Tag
-            if t.offset - self.last_processed_offset < (self.pre_len_syms + self.header_len_syms):
-                continue
-
-            rel_idx = int(t.offset - n_read_abs)
-
-            pre_start = rel_idx + 1
-            pre_end = pre_start + self.pre_len_syms
-            hdr_start = pre_end
-            hdr_end = hdr_start + self.header_len_syms
-
-            #print(f"--->info1 pre_start:{pre_start} in_pos:{in_pos} hdr_end:{hdr_end} n_in:{n_in} t.offset:{t.offset}");
-            if pre_start < in_pos:
-                print(f"check fail1 {pre_start} {in_pos}\n");
-                continue
-
-            if pre_start < 0 or hdr_end > n_in:
-                print(f"check fail2 pre_start:{pre_start} hdr_end:{hdr_end} n_in:{n_in}\n");
-                break
-
-            in_pos = pre_end
-
-            pre_iq = in_iq[pre_start:pre_end]
-            best_rot_idx, best_rot = self._resolve_ambiguity(pre_iq)
-
-            # 解旋轉 Header
-            hdr_iq = in_iq[hdr_start:hdr_end] * np.conj(best_rot)
-            hdr_syms = [self.qam16_const.decision_maker(s) for s in hdr_iq]
-            
-            header_bytes = []
-            for i in range(0, self.header_len_syms, 2):
-                byte_val = ((int(hdr_syms[i]) & 0x0F) << 4) | (int(hdr_syms[i+1]) & 0x0F)
-                header_bytes.append(int(byte_val))
-
-            # Header 格式合規檢驗: [0x10, seq, payload_len, 0xAB]
-            
-            chk_sum = np.uint8((header_bytes[0] + header_bytes[1] + header_bytes[2]) & 0xFF)
-            print(f"header {[hex(b) for b in header_bytes]} chk_sum: {hex(chk_sum)}")
-            
-            #if header_bytes[0] != 0x10 or header_bytes[2] != 0x8:
-            if header_bytes[3] != chk_sum:
-                print(f"check sum fail {hex(header_bytes[3])} != {hex(chk_sum)}\n");                
-                continue
-            
-
-            seq_num = int(header_bytes[1])
-            payload_len = int(header_bytes[2])
-            #print(f"packet info seq_num: {seq_num} payload_len: {payload_len}")
-
-            # 邊界防護：防止異常長度造成內部 Buffer Stall
-            if payload_len > self.max_payload_bytes or payload_len == 0:
-                print(f"fail payload_len:{payload_len} self.max_payload_bytes:{self.max_payload_bytes} ")
-                continue
-
-            pay_start = hdr_end
-            total_payload_syms = (payload_len + 2) * 2
-            pay_end = pay_start + total_payload_syms
-
-            if pay_end > n_in:
-                print(f"fail pay_end:{pay_end} n_in:{n_in} ")
-                break
-
-            passthrough_len = pre_start - in_pos
-            if out_pos + passthrough_len + total_payload_syms > n_out_avail:
-                print(f"fail out_pos:{out_pos} passthrough_len:{passthrough_len} total_payload_syms:{total_payload_syms} n_out_avail:{n_out_avail}")
-                break
-
-            if passthrough_len > 0:
-                out_iq[out_pos:out_pos+passthrough_len] = in_iq[in_pos:pre_start]
-                out_pos += passthrough_len
-
-            pay_iq = in_iq[pay_start:pay_end] * np.conj(best_rot)
-            out_iq[out_pos:out_pos+len(pay_iq)] = pay_iq
-
-            payload_start_out_abs = self.nitems_written(0) + out_pos
-            self.add_item_tag(0, payload_start_out_abs, pmt.intern("payload_len"), pmt.from_long(payload_len))
-            self.add_item_tag(0, payload_start_out_abs, pmt.intern("seq_num"), pmt.from_long(seq_num))
-
-            self.last_processed_offset = t.offset
-            out_pos += len(pay_iq)
-            in_pos = pay_end
-            #print(f"packet end in_pos:{in_pos} out_pos:{out_pos}\n")
-
-        if in_pos > 0:
-            self.consume(0, in_pos)
-        print(f"search done {in_pos} {out_pos}\n")
-        return out_pos
 
 # ============================================================
 # 5. Payload Demodulator & CRC Checker
 # ============================================================
-class qam16_payload_demod(gr.sync_block):
-    def __init__(self):
-        gr.sync_block.__init__(
-            self,
-            name="qam16_payload_demod",
-            in_sig=[np.complex64],
-            out_sig=None
-        )
-        self.qam16_const = QAM16_CONST
-        self.last_seq = -1
-
-    def work(self, input_items, output_items):
-        in_iq = input_items[0]
-        n_in = len(in_iq)
-        if n_in == 0:
-            return 0
-
-        tags = self.get_tags_in_window(0, 0, n_in)
-        n_read_abs = self.nitems_read(0)
-                
-        for t in tags:
-            if t.key == pmt.intern("payload_len"):
-                rel_idx = int(t.offset - n_read_abs)
-                payload_len = pmt.to_long(t.value)
-
-                seq_num = -1
-                for t_seq in tags:
-                    if t_seq.key == pmt.intern("seq_num") and t_seq.offset == t.offset:
-                        seq_num = pmt.to_long(t_seq.value)
-
-                total_syms = (payload_len + 2) * 2
-                if rel_idx + total_syms > n_in:
-                    continue
-
-                pay_iq = in_iq[rel_idx:rel_idx + total_syms]
-                pay_syms = [self.qam16_const.decision_maker(s) for s in pay_iq]
-
-                bytes_out = []
-                for i in range(0, len(pay_syms) - 1, 2):
-                    bytes_out.append(((pay_syms[i] & 0x0F) << 4) | (pay_syms[i+1] & 0x0F))
-
-                payload = bytes_out[:payload_len]
-                crc_rx = (bytes_out[payload_len] << 8) | bytes_out[payload_len + 1]
-                crc_calc = crc16_ibm(payload)
-
-                if crc_rx == crc_calc:
-                    drop_str = ""
-                    if self.last_seq != -1 and seq_num != (self.last_seq + 1) % 256:
-                        missing = (seq_num - self.last_seq - 1) % 256
-                        drop_str = f" [MISSING {missing} PKTS]"
-                    self.last_seq = seq_num
-
-                    print(f"[RX Demod] PASS | Packet #{seq_num:3d} | Data: {payload}{drop_str}")
-
-        return n_in
 
 # ============================================================
 # 6. Rx Block (Complete & Optimized DSP Chain)
@@ -822,8 +536,8 @@ class top_gui(Qt.QWidget):
         isi_taps = [1.0 + 0.0j]
 
         self.channel = channels.channel_model(
-            noise_voltage=0.002,        # AWGN 雜訊
-            frequency_offset=0.0002,   # 頻率偏差 (CFO)
+            noise_voltage=0.004,        # AWGN 雜訊
+            frequency_offset=0.002,   # 頻率偏差 (CFO)
             epsilon=1.0,
             taps=isi_taps,             # ISI 響應
             noise_seed=42,

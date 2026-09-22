@@ -15,11 +15,12 @@ from QAM16_symbol_dsp import *
 from QAM64_symbol_dsp import *
 from QAM256_symbol_dsp import *
 from pkt_trx_example_qpsk import *
+from pkt_trx_example_16QAM import *
 
 # ---------------------------------------------------------
 #  主程式
 # ---------------------------------------------------------
-RF_CH_MODEL = True
+RF_CH_MODEL = False
 
 class qpsk_cable_demo(gr.top_block):
     def __init__(self):
@@ -31,12 +32,12 @@ class qpsk_cable_demo(gr.top_block):
               
         #self.sym_dsp_tx = QPSK_TX_block(sps=sps, samp_rate=samp_rate)
         #self.sym_dsp_rx = QPSK_RX_block(sps=sps, samp_rate=samp_rate)
-        #self.sym_dsp_tx = QAM16_TX_block(sps=sps, samp_rate=samp_rate)
-        #self.sym_dsp_rx = QAM16_RX_block(sps=sps, samp_rate=samp_rate)
+        self.sym_dsp_tx = QAM16_TX_block(sps=sps, samp_rate=samp_rate)
+        self.sym_dsp_rx = QAM16_RX_block(sps=sps, samp_rate=samp_rate)
         #self.sym_dsp_tx = QAM64_TX_block(sps=sps, samp_rate=samp_rate)
         #self.sym_dsp_rx = QAM64_RX_block(sps=sps, samp_rate=samp_rate)
-        self.sym_dsp_tx = QAM256_TX_block(sps=sps, samp_rate=samp_rate)
-        self.sym_dsp_rx = QAM256_RX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_tx = QAM256_TX_block(sps=sps, samp_rate=samp_rate)
+        #self.sym_dsp_rx = QAM256_RX_block(sps=sps, samp_rate=samp_rate)
 
 
         n_symbols = 200000
@@ -235,8 +236,8 @@ class pkt_trx_demo(gr.top_block):
         buf_len = 16384
         alpha = 0.35
                       
-        self.sym_dsp_tx = tx_block(sps, samp_rate, alpha)
-        self.sym_dsp_rx = rx_block(sps, samp_rate, alpha)
+        self.sym_dsp_tx = pkt_tx_16QAM(sps, samp_rate, alpha)
+        self.sym_dsp_rx = pkt_rx_16QAM(sps, samp_rate, alpha)
 
 
         n_symbols = 200000
@@ -261,6 +262,7 @@ class pkt_trx_demo(gr.top_block):
                 rx_lo=915e6,
                 buf_len=buf_len
             )   
+            
                 
         self.freq_sink = qtgui.freq_sink_c(
             8192,
@@ -278,8 +280,9 @@ class pkt_trx_demo(gr.top_block):
         #    1
         #)
         #self.const_sink.set_x_axis(-2.0, 2.0)
-        #self.const_sink.set_y_axis(-2.0, 2.0)
-        self.const_win = sip.wrapinstance(self.sym_dsp_rx.qt_pre.qwidget(), Qt.QWidget)
+        #self.const_sink.set_y_axis(-2.0, 2.0)        
+        #self.const_win = sip.wrapinstance(self.sym_dsp_tx.qt_post.qwidget(), Qt.QWidget)
+        self.const_win = sip.wrapinstance(self.sym_dsp_rx.qt_post.qwidget(), Qt.QWidget)
 
         const = QPSK_CONST
         raw_pts = np.array(const.points(), dtype=np.complex64)

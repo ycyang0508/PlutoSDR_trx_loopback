@@ -100,7 +100,7 @@ class sequential_packet_gen(gr.sync_block):
             idx = self.const.decision_maker(pt)
             self.reordered_points[idx] = pt
 
-        self.dummy_syms = barker_to_16qam_symbols([1, -1] * 4)
+        self.dummy_syms = barker_to_16qam_symbols([1, -1] * 16)
         self.preamble_syms = QAM16_PREAMBLE_SYMBOLS
         self.zeros_syms = [0+0j] * 8
 
@@ -405,10 +405,10 @@ class packet_parsing(gr.sync_block):
                     crc_rx = (bytes_out[self.current_payload_len] << 8) | bytes_out[self.current_payload_len + 1]
                     crc_calc = crc16_ibm(payload)
 
-                    if crc_rx == crc_calc:                        
+                    if crc_rx == crc_calc:                                                
                         print(f"[RX Payload] SUCCESS 🎉 | Seq #{self.current_seq} | Data: {payload}")
                     else:
-                        print(f"[RX Payload] CRC ERROR ❌ | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)}")
+                        print(f"[RX Payload] CRC ERROR ❌ | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)} | Data: {payload}")
 
                     # 處理完一個封包後，回到初始狀態繼續尋找下一個 Preamble
                     self.state = self.RX_SEARCH_PREAMBLE
@@ -434,9 +434,13 @@ class pkt_rx_16QAM(gr.hier_block2):
             gr.io_signature(0, 0, 0)
         )
 
+        
+
         sym_rate = samp_rate // sps
         ntaps = 15 * sps + 1
         self.const = QAM16_CONST
+
+        self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
         # 1. Matched Filter (RRC Filter)
         rrc_taps = filter.firdes.root_raised_cosine(
@@ -465,6 +469,7 @@ class pkt_rx_16QAM(gr.hier_block2):
             #n_filters     = ntaps,
             #taps          = rrc_taps
         )
+                
 
         self.eq_alg = digital.adaptive_algorithm_cma(self.const, eq_gain,1.0)
         self.eq = digital.linear_equalizer(
@@ -473,7 +478,6 @@ class pkt_rx_16QAM(gr.hier_block2):
             alg=self.eq_alg,
             adapt_after_training=False
         )
-
         
         # 4. Carrier Frequency & Phase Tracking (Costas Loop)
         # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動        
@@ -482,12 +486,13 @@ class pkt_rx_16QAM(gr.hier_block2):
             order=4,
             use_snr=False
         )
+        
 
         self.preamble_det = preamble_detector_cc(QAM16_PREAMBLE_SYMBOLS)
         
         
-        self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate/sps, True)
-
+        #self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate/sps, True)
+        
         
 
         self.pkt_parsing = packet_parsing()
@@ -496,25 +501,25 @@ class pkt_rx_16QAM(gr.hier_block2):
         #self.demod = qam16_payload_demod()
 
         # GUI Sink
-        self.copy = blocks.copy(gr.sizeof_gr_complex)
+        #self.copy = blocks.copy(gr.sizeof_gr_complex)
         self.qt_post = qtgui.const_sink_c(1024, '16QAM Constellation', 1)
 
         # DSP Chain 連線
         self.connect(
-                     self,
+                     self,         
+                     self.throttle,
                      self.rrc_rx,
                      self.agc,
-                     self.clock_sync,      # 先鎖 timing   
-                     self.eq,
-                     self.costas,
+                     self.clock_sync,      # 先鎖 timing                        
+                     self.eq,                     
+                     self.costas,                       
                      self.preamble_det,    # 在 Costas 之前做 preamble + phase 解旋
-                     self.copy,
-                     self.throttle,
+                     #self.copy,                     
                      self.pkt_parsing,
                     )
 
 
-        self.connect(self.copy, self.qt_post)
+        self.connect(self.preamble_det, self.qt_post)
 
 # ============================================================
 # 7. GUI Top Block

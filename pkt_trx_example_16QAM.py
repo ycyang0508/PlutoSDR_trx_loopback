@@ -166,7 +166,7 @@ class sequential_packet_gen(gr.sync_block):
 # ============================================================
 # 3. Tx Block
 # ============================================================
-class tx_block(gr.hier_block2):
+class pkt_tx_16QAM(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
         gr.hier_block2.__init__(
             self,
@@ -425,7 +425,7 @@ class packet_parsing(gr.sync_block):
 # ============================================================
 # 6. Rx Block (Complete & Optimized DSP Chain)
 # ============================================================
-class rx_block(gr.hier_block2):
+class pkt_rx_16QAM(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
         gr.hier_block2.__init__(
             self,
@@ -530,8 +530,8 @@ class top_gui(Qt.QWidget):
         alpha = 0.35
         samp_rate = 1_000_000
 
-        self.tx = tx_block(sps, samp_rate, alpha)
-        self.rx = rx_block(sps, samp_rate, alpha)
+        self.tx = pkt_tx_16QAM(sps, samp_rate, alpha)
+        self.rx = pkt_rx_16QAM(sps, samp_rate, alpha)
 
         isi_taps = [1.0 + 0.0j]
 

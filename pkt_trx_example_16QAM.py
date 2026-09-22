@@ -426,7 +426,7 @@ class packet_parsing(gr.sync_block):
 # 6. Rx Block (Complete & Optimized DSP Chain)
 # ============================================================
 class pkt_rx_16QAM(gr.hier_block2):
-    def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
+    def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35,eq_taps=15, eq_gain=0.001):
         gr.hier_block2.__init__(
             self,
             "rx_block",
@@ -448,8 +448,8 @@ class pkt_rx_16QAM(gr.hier_block2):
         )
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
-        # 2. AGC (標竿參考功率設為 1.0)
-        #self.agc = analog.agc2_cc(1e-4, 1e-5, 1.0, 1.0)
+        # 2. AGC (標竿參考功率設為 1.0)        
+        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
@@ -464,11 +464,17 @@ class pkt_rx_16QAM(gr.hier_block2):
             digital.IR_MMSE_8TAP,
         )
 
-        
+        self.eq_alg = digital.adaptive_algorithm_cma(self.const, eq_gain,1.0)
+        self.eq = digital.linear_equalizer(
+            num_taps=eq_taps,
+            sps=1,  # Clock Sync 輸出已降至 1 sps
+            alg=self.eq_alg,
+            adapt_after_training=False
+        )
 
-        # 4. Carrier Frequency & Phase Tracking (Costas Loop)
-        # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動
         
+        # 4. Carrier Frequency & Phase Tracking (Costas Loop)
+        # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動        
         self.costas = digital.costas_loop_cc(
             loop_bw=0.008,
             order=4,
@@ -477,22 +483,10 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         self.preamble_det = preamble_detector_cc(QAM16_PREAMBLE_SYMBOLS)
         
-        # 6. Header Strip & Ambiguity Resolver
-        #self.header_strip = qam16_header_strip_with_phase(
-        #    preamble_len_syms=len(QAM16_PREAMBLE_SYMBOLS),
-        #    header_len_bytes=4,
-        #    max_payload_bytes=256
-        #)
-
-
+        
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate/sps, True)
 
-        #self.constellation_rec = digital.constellation_receiver_cb(
-        #    constellation=self.const,
-        #    loop_bw=0.02,
-        #    fmin=-0.05,
-        #    fmax=0.05
-        #)
+        
 
         self.pkt_parsing = packet_parsing()
 
@@ -507,7 +501,9 @@ class pkt_rx_16QAM(gr.hier_block2):
         self.connect(
                      self,
                      self.rrc_rx,
-                     self.clock_sync,      # 先鎖 timing                     
+                     self.agc,
+                     self.clock_sync,      # 先鎖 timing   
+                     self.eq,
                      self.costas,
                      self.preamble_det,    # 在 Costas 之前做 preamble + phase 解旋
                      self.copy,
@@ -532,8 +528,8 @@ class top_gui(Qt.QWidget):
 
         self.tx = pkt_tx_16QAM(sps, samp_rate, alpha)
         self.rx = pkt_rx_16QAM(sps, samp_rate, alpha)
-
-        isi_taps = [1.0 + 0.0j]
+        
+        isi_taps = [1.0 + 0.0j, 0.25 + 0.1j, 0.15 - 0.05j]
 
         self.channel = channels.channel_model(
             noise_voltage=0.004,        # AWGN 雜訊

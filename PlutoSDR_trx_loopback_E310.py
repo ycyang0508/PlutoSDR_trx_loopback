@@ -231,17 +231,19 @@ class pkt_trx_demo(gr.top_block):
     def __init__(self):
         gr.top_block.__init__(self)
 
-        samp_rate = 1_000_000
+        samp_rate = 1_000_000        
         sps = 4
         buf_len = 16384
         alpha = 0.35
                       
+        #self.sym_dsp_tx = pkt_tx_QPSK(sps, samp_rate, alpha)
+        #self.sym_dsp_rx = pkt_rx_QPSK(sps, samp_rate, alpha)
         self.sym_dsp_tx = pkt_tx_16QAM(sps, samp_rate, alpha)
         self.sym_dsp_rx = pkt_rx_16QAM(sps, samp_rate, alpha)
 
 
-        n_symbols = 200000
-        constellation_point = 4
+        #n_symbols = 200000
+        #constellation_point = 4
 
 
         if RF_CH_MODEL:
@@ -287,7 +289,7 @@ class pkt_trx_demo(gr.top_block):
         const = QPSK_CONST
         raw_pts = np.array(const.points(), dtype=np.complex64)
         points = raw_pts / np.abs(raw_pts[0])
-        self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
+        #self.evm = evm_generic_block(points, window=2048, skip_samples=32768)
 
         self.evm_sink = qtgui.number_sink(
             gr.sizeof_float,
@@ -330,9 +332,9 @@ def run_pkt_demo():
 
     win = Qt.QWidget()
     layout = Qt.QVBoxLayout(win)
-    layout.addWidget(tb.freq_win)
+    #layout.addWidget(tb.freq_win)
     layout.addWidget(tb.const_win)
-    layout.addWidget(tb.evm_sink_win)
+    #layout.addWidget(tb.evm_sink_win)
     win.show()
 
     tb.start()

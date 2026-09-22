@@ -112,7 +112,7 @@ class dynamic_packet_generator(gr.sync_block):
         self.buffer = self.buffer[n_out:]
         return n_out
 
-class tx_block(gr.hier_block2):
+class pkt_tx_QPSK(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
         gr.hier_block2.__init__(
             self,
@@ -340,7 +340,7 @@ class payload_parser_from_symbols(gr.basic_block):
 # ============================================================
 # 5. RX Block (assemble pipeline with Equalizer & Dual AGC)
 # ============================================================
-class rx_block(gr.hier_block2):
+class pkt_rx_QPSK(gr.hier_block2):
     def __init__(self, sps=4, samp_rate=1_000_000, alpha=0.35):
         gr.hier_block2.__init__(
             self,
@@ -397,7 +397,8 @@ class rx_block(gr.hier_block2):
         self.qpsk_decoder = digital.constellation_decoder_cb(QPSK_CONST)
         self.payload_parser_sym = payload_parser_from_symbols()
 
-        self.qt_pre = qtgui.const_sink_c(256, 'Constellation Diagram (After Costas & EQ)', 1)
+        self.qt_post = qtgui.const_sink_c(256, 'Constellation Diagram (After Costas & EQ)', 1)
+        
 
         # Connections
         self.connect(self, self.symbol_sync)
@@ -407,7 +408,7 @@ class rx_block(gr.hier_block2):
         self.connect(self.equalizer, self.agc2)
         self.connect(self.agc2, self.costas)
 
-        self.connect(self.costas, self.qt_pre)
+        self.connect(self.costas, self.qt_post)
         self.connect(self.costas, self.corr)
         self.connect(self.corr, self.header_strip)
         self.connect(self.header_strip, self.qpsk_decoder)
@@ -425,8 +426,8 @@ class top_gui(Qt.QWidget):
         alpha = 0.35
         samp_rate = 1_000_000
 
-        self.tx = tx_block(sps, samp_rate, alpha)
-        self.rx = rx_block(sps, samp_rate, alpha)
+        self.tx = pkt_tx_QPSK(sps, samp_rate, alpha)
+        self.rx = pkt_rx_QPSK(sps, samp_rate, alpha)
 
         # ========================================================
         # 【新增】多路徑 ISI 通道設定 (Multipath Taps)

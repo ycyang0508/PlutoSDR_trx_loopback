@@ -405,7 +405,7 @@ class packet_parsing(gr.sync_block):
                     crc_rx = (bytes_out[self.current_payload_len] << 8) | bytes_out[self.current_payload_len + 1]
                     crc_calc = crc16_ibm(payload)
 
-                    if crc_rx == crc_calc:
+                    if crc_rx == crc_calc:                        
                         print(f"[RX Payload] SUCCESS 🎉 | Seq #{self.current_seq} | Data: {payload}")
                     else:
                         print(f"[RX Payload] CRC ERROR ❌ | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)}")
@@ -453,15 +453,17 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
-            digital.TED_GARDNER          ,
-            sps,
-            0.001,
-            1.0,
-            1.0,
-            1.5,
-            1,
-            self.const,
-            digital.IR_MMSE_8TAP,
+            detector_type = digital.TED_GARDNER          ,
+            sps           = sps,
+            loop_bw       = 0.001,
+            damping_factor= 1.0,
+            ted_gain      = 1.0,
+            max_deviation = 1.5,
+            osps          = 1,
+            slicer        = self.const,
+            interp_type   = digital.IR_MMSE_8TAP,
+            #n_filters     = ntaps,
+            #taps          = rrc_taps
         )
 
         self.eq_alg = digital.adaptive_algorithm_cma(self.const, eq_gain,1.0)
@@ -495,7 +497,7 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         # GUI Sink
         self.copy = blocks.copy(gr.sizeof_gr_complex)
-        self.qt_post = qtgui.const_sink_c(512, '16QAM Constellation', 1)
+        self.qt_post = qtgui.const_sink_c(1024, '16QAM Constellation', 1)
 
         # DSP Chain 連線
         self.connect(

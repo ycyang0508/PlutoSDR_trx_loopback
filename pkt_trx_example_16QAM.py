@@ -44,17 +44,27 @@ def barker_to_16qam_symbols(barker_list):
 #QAM16_PREAMBLE_SYMBOLS = barker_to_16qam_symbols(BARKER_26_BITS)
 #preamble = QAM16_PREAMBLE_SYMBOLS
 
-preamble = np.array([
-    0.316+0.316j,
-    0.948+0.316j,
-    0.316+0.948j,
-    -0.316+0.316j,
-    -0.948+0.316j,
-    -0.316+0.948j,
-    0.948+0.948j,
-    -0.948+0.948j,      
+def zadoff_chu(N, u):
+    n = np.arange(N)
+    return np.exp(-1j * np.pi * u * n * (n + 1) / N).astype(np.complex64)
 
-], dtype=np.complex64)
+#preamble = np.array([
+#    0.316+0.316j,
+#    0.948+0.316j,
+#    0.316+0.948j,
+#    -0.316+0.316j,
+#    -0.948+0.316j,
+#    -0.316+0.948j,
+#    0.948+0.948j,
+#    -0.948+0.948j,      
+#
+#], dtype=np.complex64)
+
+preamble = zadoff_chu(7, 1)
+
+
+
+
 
 QAM16_PREAMBLE_SYMBOLS = preamble
 
@@ -351,14 +361,14 @@ class packet_parsing(gr.sync_block):
                         self.current_seq = header_bytes[1]
                         self.current_payload_len = header_bytes[2]
                         
-                        print(f"[RX Header] PASS | Seq: {self.current_seq}, Payload Len: {self.current_payload_len}")
+                        #print(f"[RX Header] PASS | Seq: {self.current_seq}, Payload Len: {self.current_payload_len}")
                         
                         # 準備進入 Payload 階段 (Payload + 2 Bytes CRC)
                         self.state = self.RX_PAYLOAD
                         self.payload_syms_needed = (self.current_payload_len + 2) * 2
                         self.collected_syms = []
                     else:
-                        print(f"[RX Header] FAIL | Checksum mismatch: {hex(header_bytes[3])} != {hex(chk_sum)}")
+                        print(f"[RX Header] FAIL | phase fix {self.phase} | Checksum mismatch: {hex(header_bytes[3])} != {hex(chk_sum)}")
                         # 失敗則重置回搜尋狀態
                         self.state = self.RX_SEARCH_PREAMBLE
                         self.collected_syms = []
@@ -381,9 +391,10 @@ class packet_parsing(gr.sync_block):
                     crc_calc = crc16_ibm(payload)
 
                     if crc_rx == crc_calc:                                                
-                        print(f"[RX Payload] SUCCESS 🎉 | Seq #{self.current_seq} | Data: {payload}")
+                        pass
+                        print(f"[RX Payload] SUCCESS 🎉 |  phase fix {self.phase} | Seq #{self.current_seq} | Data: {payload}")
                     else:
-                        print(f"[RX Payload] CRC ERROR ❌ | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)} | Data: {payload}")
+                        print(f"[RX Payload] CRC ERROR ❌ |  phase fix {self.phase} | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)} | Data: {payload}")
 
                     # 處理完一個封包後，回到初始狀態繼續尋找下一個 Preamble
                     self.state = self.RX_SEARCH_PREAMBLE
@@ -392,10 +403,6 @@ class packet_parsing(gr.sync_block):
         self.consume(0, n)            
         return 0
 
-
-# ============================================================
-# 5. Payload Demodulator & CRC Checker
-# ============================================================
 
 # ============================================================
 # 6. Rx Block (Complete & Optimized DSP Chain)

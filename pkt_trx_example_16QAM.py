@@ -179,12 +179,11 @@ class pkt_tx_16QAM(gr.hier_block2):
         ntaps = 15 * sps + 1
 
         self.pkt_gen = sequential_packet_gen(min_payload_len=PAYLOAD_BYTES,max_payload_len=PAYLOAD_BYTES*2)
-        rrc = firdes.root_raised_cosine(1.0, samp_rate, sym_rate, alpha, ntaps)
+        rrc = firdes.root_raised_cosine(sps, samp_rate, sym_rate, alpha, ntaps)
         self.rrc = filter.interp_fir_filter_ccf(sps, rrc)
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
         self.connect(self.pkt_gen, self.rrc, self.throttle, self)
-
 
 class preamble_detector_cc(gr.sync_block):
     def __init__(self, preamble_syms):
@@ -195,98 +194,74 @@ class preamble_detector_cc(gr.sync_block):
             out_sig=[np.complex64],
         )
 
-        # 參考 preamble（理想 16QAM 符號）
         self.ref = np.array(preamble_syms, dtype=np.complex64)
         self.pre_len = len(self.ref)
+        self.candidates = np.array([0, np.pi/2, np.pi, 3*np.pi/2], dtype=np.float32)
 
-        # 象限候選（0, 90, 180, 270 度）
-        self.candidates = [0, np.pi/2, np.pi, 3*np.pi/2]
-
-        # 跨區塊的歷史緩衝與邊界狀態
         self.history = np.array([], dtype=np.complex64)
         self.last_mag = 0.0
-        self.threshold = 0.85  # 可根據通道雜訊調整的門檻值
+        self.threshold = 0.95
+        self.ref_norm = np.linalg.norm(self.ref)
 
     def _resolve_phase(self, rx_pre):
-        best_phi = None
-        best_dist = 1e99
-
-        for phi in self.candidates:
-            rotated = rx_pre * np.exp(-1j * phi)
-            dist = np.sum(np.abs(rotated - self.ref)**2)
-
-            if dist < best_dist:
-                best_dist = dist
-                best_phi = phi
-
-        return best_phi, best_dist
+        # 向量化相位候選比較
+        # rx_pre shape: (pre_len,), candidates shape: (4, 1)
+        rotated = rx_pre * np.exp(-1j * self.candidates[:, None])
+        dists = np.sum(np.abs(rotated - self.ref)**2, axis=1)
+        best_idx = np.argmin(dists)
+        return self.candidates[best_idx], dists[best_idx]
 
     def work(self, input_items, output_items):
         inp = input_items[0]
         out = output_items[0]
         n = len(inp)
+        if n == 0:
+            return 0
 
-        nread  = self.nitems_read(0)
         nwrite = self.nitems_written(0)
 
-        # 1. 結合歷史資料與當前輸入，計算所有點的 Normalized Correlation
+        # 1. 結合歷史資料與當前輸入
         full_data = np.concatenate([self.history, inp])
-        
-        mags = np.zeros(n, dtype=np.float32)
-        phases = np.zeros(n, dtype=np.float32)
-        ref_norm = np.linalg.norm(self.ref)
 
-        for i in range(n):
-            # 取出以當前索引為結尾的滑動視窗
-            window = full_data[i : i + self.pre_len]
-            if len(window) < self.pre_len:
-                continue
+        # 2. 向量化計算 Normalized Correlation (取代原本的 for 迴圈)
+        # 分子：使用 np.correlate 計算滑動內積
+        numerators = np.correlate(full_data, self.ref, mode='valid')
 
-            # 計算 normalized correlation
-            c = np.vdot(window, self.ref)
-            denom = np.linalg.norm(window) * ref_norm + 1e-12
-            c_norm = c / denom
-            mag = np.abs(c_norm)
-            mags[i] = mag
+        # 分母：利用累加和 (cumsum) 快速計算每個滑動視窗的能量平方和
+        sq_data = np.abs(full_data)**2
+        cumsum_sq = np.concatenate(([0.0], np.cumsum(sq_data)))
+        window_sums = cumsum_sq[self.pre_len:] - cumsum_sq[:-self.pre_len]
+        denominators = np.sqrt(np.maximum(window_sums, 0.0)) * self.ref_norm + 1e-12
 
-            # 若高於粗檢門檻，預先計算該點的相位解算
-            if mag > 0.7:
-                best_phi, _ = self._resolve_phase(window)
-                phases[i] = best_phi
-            else:
-                phases[i] = 0.0
+        mags = np.abs(numerators) / denominators
 
-        # 2. 檢查 Threshold 與 Local Maximum，判定真正的 preamble 起點
-        for i in range(n):
-            if mags[i] < self.threshold:
-                continue
+        # 3. 找出所有高於門檻值的候選點索引
+        candidate_indices = np.where(mags >= self.threshold)[0]
 
-            # 取得左右鄰居數值以判斷 Local Maximum
+        # 4. 僅對通過門檻的點檢查 Local Maximum 並解算相位
+        for i in candidate_indices:
             left_val = self.last_mag if i == 0 else mags[i - 1]
             right_val = 0.0 if i == n - 1 else mags[i + 1]
 
-            # 滿足大於門檻且為區域最大值（大於或等於兩側）
             if mags[i] >= left_val and mags[i] >= right_val:
-                best_phi = phases[i]
+                window = full_data[i : i + self.pre_len]
+                best_phi, _ = self._resolve_phase(window)
                 pre_start = nwrite + i 
 
-                # 打上精準對齊的 preamble_match Tag
                 self.add_item_tag(
                     0,
                     pre_start,
                     pmt.intern("preamble_match"),                            
                     pmt.from_double(best_phi)
                 )
-                #print(f"[PRE DET] Local Max Hit at abs_idx={pre_start}, mag={mags[i]:.4f}, phi={best_phi}")
 
-        # 3. 更新下一個 block 所需的歷史記錄與邊界狀態
+        # 5. 更新歷史記錄與邊界狀態
         if n >= self.pre_len - 1:
             self.history = inp[-(self.pre_len - 1):]
         else:
             self.history = full_data[-(self.pre_len - 1):]
         
-        if n > 0:
-            self.last_mag = mags[-1]
+        self.last_mag = mags[-1] if len(mags) > 0 else 0.0
 
         out[:] = inp
         return n
@@ -466,11 +441,11 @@ class pkt_rx_16QAM(gr.hier_block2):
             osps          = 1,
             slicer        = self.const,
             interp_type   = digital.IR_MMSE_8TAP,
-            #n_filters     = ntaps,
-            #taps          = rrc_taps
+            n_filters     = ntaps,
+            taps          = rrc_taps
         )
-                
-
+            
+        
         self.eq_alg = digital.adaptive_algorithm_cma(self.const, eq_gain,1.0)
         self.eq = digital.linear_equalizer(
             num_taps=eq_taps,
@@ -501,8 +476,9 @@ class pkt_rx_16QAM(gr.hier_block2):
         #self.demod = qam16_payload_demod()
 
         # GUI Sink
-        #self.copy = blocks.copy(gr.sizeof_gr_complex)
+        self.copy = blocks.copy(gr.sizeof_gr_complex)
         self.qt_post = qtgui.const_sink_c(1024, '16QAM Constellation', 1)
+        self.null_sink = blocks.null_sink(gr.sizeof_gr_complex)
 
         # DSP Chain 連線
         self.connect(
@@ -510,14 +486,14 @@ class pkt_rx_16QAM(gr.hier_block2):
                      self.throttle,
                      self.rrc_rx,
                      self.agc,
-                     self.clock_sync,      # 先鎖 timing                        
+                     self.clock_sync,      # 先鎖 timing                                             
                      self.eq,                     
                      self.costas,                       
                      self.preamble_det,    # 在 Costas 之前做 preamble + phase 解旋
-                     #self.copy,                     
+                     #self.null_sink
                      self.pkt_parsing,
                     )
-
+        
 
         self.connect(self.preamble_det, self.qt_post)
 

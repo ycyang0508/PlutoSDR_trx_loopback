@@ -48,6 +48,9 @@ def zadoff_chu(N, u):
     n = np.arange(N)
     return np.exp(-1j * np.pi * u * n * (n + 1) / N).astype(np.complex64)
 
+angles = np.array([0, 0, 0, np.pi/2, np.pi, np.pi/2, 3*np.pi/2, np.pi]) # 相位角度
+preamble_opt = np.exp(1j * angles).astype(np.complex64)
+
 #preamble = np.array([
 #    0.316+0.316j,
 #    0.948+0.316j,
@@ -62,10 +65,6 @@ def zadoff_chu(N, u):
 
 preamble = zadoff_chu(7, 1)
 
-
-
-
-
 QAM16_PREAMBLE_SYMBOLS = preamble
 
 
@@ -77,7 +76,7 @@ RX_PAYLOAD         = 2
 HEADER_BYTES    = 4
 HEADER_SYMBOLS  = HEADER_BYTES*2
 
-PAYLOAD_BYTES    = 8
+PAYLOAD_BYTES    = 32
 PAYLOAD_SYMBOL   = PAYLOAD_BYTES*2
 
 
@@ -110,7 +109,7 @@ class sequential_packet_gen(gr.sync_block):
             idx = self.const.decision_maker(pt)
             self.reordered_points[idx] = pt
 
-        self.dummy_syms = barker_to_16qam_symbols([1, -1] * 16)
+        self.dummy_syms = barker_to_16qam_symbols([1, -1] * 512)
         self.preamble_syms = QAM16_PREAMBLE_SYMBOLS
         self.zeros_syms = [0+0j] * 8
 
@@ -392,7 +391,7 @@ class packet_parsing(gr.sync_block):
 
                     if crc_rx == crc_calc:                                                
                         pass
-                        print(f"[RX Payload] SUCCESS 🎉 |  phase fix {self.phase} | Seq #{self.current_seq} | Data: {payload}")
+                        #print(f"[RX Payload] SUCCESS 🎉 |  phase fix {self.phase} | Seq #{self.current_seq} | Data: {payload}")
                     else:
                         print(f"[RX Payload] CRC ERROR ❌ |  phase fix {self.phase} | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)} | Data: {payload}")
 
@@ -424,6 +423,9 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
+        self.agc2 = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+
+
         # 1. Matched Filter (RRC Filter)
         rrc_taps = filter.firdes.root_raised_cosine(
             gain=sps,
@@ -435,7 +437,7 @@ class pkt_rx_16QAM(gr.hier_block2):
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
         # 2. AGC (標竿參考功率設為 1.0)        
-        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+        #self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
@@ -451,7 +453,8 @@ class pkt_rx_16QAM(gr.hier_block2):
             n_filters     = ntaps,
             taps          = rrc_taps
         )
-            
+          
+        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
         
         self.eq_alg = digital.adaptive_algorithm_cma(self.const, eq_gain,1.0)
         self.eq = digital.linear_equalizer(
@@ -489,13 +492,14 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         # DSP Chain 連線
         self.connect(
-                     self,         
+                     self,                              
                      self.throttle,
+                     self.agc2,
                      self.rrc_rx,
                      self.agc,
-                     self.clock_sync,      # 先鎖 timing                                             
+                     self.clock_sync,      # 先鎖 timing                                                                  
                      self.eq,                     
-                     self.costas,                       
+                     self.costas,                                            
                      self.preamble_det,    # 在 Costas 之前做 preamble + phase 解旋
                      #self.null_sink
                      self.pkt_parsing,

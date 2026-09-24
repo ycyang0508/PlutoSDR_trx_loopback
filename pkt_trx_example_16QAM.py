@@ -111,7 +111,7 @@ class sequential_packet_gen(gr.sync_block):
 
         #self.dummy_syms = barker_to_16qam_symbols([1, -1] * 512)
         rng = np.random.default_rng(42)
-        rand_idx = rng.integers(0, 16, size=512)
+        rand_idx = rng.integers(0, 16, size=256)
         self.dummy_syms = np.array([self.reordered_points[i] for i in rand_idx], dtype=np.complex64)
 
         self.preamble_syms = QAM16_PREAMBLE_SYMBOLS
@@ -473,7 +473,7 @@ class pkt_rx_16QAM(gr.hier_block2):
         # 4. Carrier Frequency & Phase Tracking (Costas Loop)
         # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動        
         self.costas = digital.costas_loop_cc(
-            loop_bw=0.008,
+            loop_bw=0.0004,
             order=4,
             use_snr=False
         )

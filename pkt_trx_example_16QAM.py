@@ -109,13 +109,9 @@ class sequential_packet_gen(gr.sync_block):
             idx = self.const.decision_maker(pt)
             self.reordered_points[idx] = pt
 
-        #self.dummy_syms = barker_to_16qam_symbols([1, -1] * 512)
-        rng = np.random.default_rng(42)
-        rand_idx = rng.integers(0, 16, size=256)
-        self.dummy_syms = np.array([self.reordered_points[i] for i in rand_idx], dtype=np.complex64)
-
+        self.dummy_syms = barker_to_16qam_symbols([1, -1] * 256)
         self.preamble_syms = QAM16_PREAMBLE_SYMBOLS
-        self.zeros_syms = [0+0j] * 4
+        self.zeros_syms = [0+0j] * 2
 
     def _nibbles_to_symbols(self, nibble_list):
         return [self.reordered_points[n & 0x0F] for n in nibble_list]
@@ -144,8 +140,7 @@ class sequential_packet_gen(gr.sync_block):
         frame_syms = np.concatenate((
             self.dummy_syms,
             self.preamble_syms,
-            data_syms,
-            self.zeros_syms
+            data_syms
         )).astype(np.complex64)
 
         self.seq_num = (self.seq_num + 1) % 256
@@ -279,9 +274,9 @@ class preamble_detector_cc(gr.sync_block):
         out[:] = inp
         return n
 
-class packet_parsing(gr.basic_block):
+class packet_parsing(gr.sync_block):
     def __init__(self):
-        gr.basic_block.__init__(
+        gr.sync_block.__init__(
             self,
             name="packet_parsing",
             in_sig=[np.complex64],
@@ -304,9 +299,8 @@ class packet_parsing(gr.basic_block):
         self.collected_syms = []
 
         self.qam16_const = QAM16_CONST
-        
 
-    def general_work(self, input_items, output_items):
+    def work(self, input_items, output_items):
         inp = input_items[0]        
         n = len(inp)
         nread = self.nitems_read(0)
@@ -314,25 +308,15 @@ class packet_parsing(gr.basic_block):
         # 檢索當前 Window 內的 Tags
         tags = self.get_tags_in_window(0, 0, n)
         rx_tags_dict = {int(t.offset - nread): t for t in tags if t.key == pmt.intern("preamble_match")}
-        last_consume = n
-        header_fail = 0
-        payload_fail = 0
-        packet_OK = 0
-        total_packet_done = 0
-        neededmore_cnt = 0
+
         for i in range(n):
             s = inp[i]
             abs_idx = nread + i
 
-            if len(rx_tags_dict) == 0:
-                break
-            if total_packet_done == len(rx_tags_dict):
-                break
             # ----------------------------------------------------
             # 狀態 1：搜尋 Preamble
             # ----------------------------------------------------
             if self.state == self.RX_SEARCH_PREAMBLE:
-                last_consume = i
                 if i in rx_tags_dict:
                     tag = rx_tags_dict[i]
                     self.phase = pmt.to_python(tag.value)
@@ -378,25 +362,14 @@ class packet_parsing(gr.basic_block):
                         #print(f"[RX Header] PASS | Seq: {self.current_seq}, Payload Len: {self.current_payload_len}")
                         
                         # 準備進入 Payload 階段 (Payload + 2 Bytes CRC)
-                        if (i + self.current_payload_len) >= n:
-                            self.state = self.RX_SEARCH_PREAMBLE
-                            self.collected_syms = []
-                            #print(f"check {i}  {self.current_payload_len} {n}")
-                            neededmore_cnt += 1
-                            break;
-                        else:                            
-                            last_consume = i
-                        #print(f"[RX Header] OK | phase fix {self.phase} ")
                         self.state = self.RX_PAYLOAD
                         self.payload_syms_needed = (self.current_payload_len + 2) * 2
                         self.collected_syms = []
                     else:
                         print(f"[RX Header] FAIL | phase fix {self.phase} | Checksum mismatch: {hex(header_bytes[3])} != {hex(chk_sum)}")
-                        last_consume = i
                         # 失敗則重置回搜尋狀態
                         self.state = self.RX_SEARCH_PREAMBLE
                         self.collected_syms = []
-                        header_fail += 1
 
             # ----------------------------------------------------
             # 狀態 3：收集 Payload 與 CRC 檢查
@@ -416,23 +389,16 @@ class packet_parsing(gr.basic_block):
                     crc_calc = crc16_ibm(payload)
 
                     if crc_rx == crc_calc:                                                
-                        packet_OK += 1
-                        print(f"[RX Payload] SUCCESS 🎉 | {i} {self.current_seq}  phase fix {self.phase} | Seq #{self.current_seq} | Data: {payload}")
+                        pass
+                        #print(f"[RX Payload] SUCCESS 🎉 |  phase fix {self.phase} | Seq #{self.current_seq} | Data: {payload}")
                     else:
-                        print(f"[RX Payload] CRC ERROR ❌ | {i} {self.current_payload_len} {self.current_seq} phase fix {self.phase} | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)} | Data: {payload}")
-                        payload_fail += 1
+                        print(f"[RX Payload] CRC ERROR ❌ |  phase fix {self.phase} | Rx: {hex(crc_rx)} vs Calc: {hex(crc_calc)} | Data: {payload}")
 
                     # 處理完一個封包後，回到初始狀態繼續尋找下一個 Preamble
-                    last_consume = i
                     self.state = self.RX_SEARCH_PREAMBLE
                     self.collected_syms = []
-                    total_packet_done += 1
 
-        if len(rx_tags_dict) != 0:
-            print(f"last_consume : {last_consume} {n} {neededmore_cnt} {header_fail} {payload_fail} {packet_OK} {len(rx_tags_dict)}\n")
-
-        last_consume = min(last_consume,n)        
-        self.consume(0, last_consume)            
+        self.consume(0, n)            
         return 0
 
 
@@ -456,7 +422,7 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
-        self.agc2 = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0,0)
+        self.agc2 = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
 
 
         # 1. Matched Filter (RRC Filter)
@@ -470,7 +436,7 @@ class pkt_rx_16QAM(gr.hier_block2):
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
         # 2. AGC (標竿參考功率設為 1.0)        
-        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0,2)
+        #self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
@@ -497,12 +463,12 @@ class pkt_rx_16QAM(gr.hier_block2):
             adapt_after_training=False
         )
 
-        #self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
         
         # 4. Carrier Frequency & Phase Tracking (Costas Loop)
         # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動        
         self.costas = digital.costas_loop_cc(
-            loop_bw=0.0004,
+            loop_bw=0.008,
             order=4,
             use_snr=False
         )

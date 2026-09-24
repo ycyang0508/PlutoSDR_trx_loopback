@@ -20,7 +20,7 @@ from pkt_trx_example_16QAM import *
 # ---------------------------------------------------------
 #  主程式
 # ---------------------------------------------------------
-RF_CH_MODEL = False
+RF_CH_MODEL = True
 
 class qpsk_cable_demo(gr.top_block):
     def __init__(self):

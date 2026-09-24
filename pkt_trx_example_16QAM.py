@@ -109,9 +109,13 @@ class sequential_packet_gen(gr.sync_block):
             idx = self.const.decision_maker(pt)
             self.reordered_points[idx] = pt
 
-        self.dummy_syms = barker_to_16qam_symbols([1, -1] * 256)
+        #self.dummy_syms = barker_to_16qam_symbols([1, -1] * 512)
+        rng = np.random.default_rng(42)
+        rand_idx = rng.integers(0, 16, size=512)
+        self.dummy_syms = np.array([self.reordered_points[i] for i in rand_idx], dtype=np.complex64)
+
         self.preamble_syms = QAM16_PREAMBLE_SYMBOLS
-        self.zeros_syms = [0+0j] * 2
+        self.zeros_syms = [0+0j] * 4
 
     def _nibbles_to_symbols(self, nibble_list):
         return [self.reordered_points[n & 0x0F] for n in nibble_list]
@@ -140,7 +144,8 @@ class sequential_packet_gen(gr.sync_block):
         frame_syms = np.concatenate((
             self.dummy_syms,
             self.preamble_syms,
-            data_syms
+            data_syms,
+            self.zeros_syms
         )).astype(np.complex64)
 
         self.seq_num = (self.seq_num + 1) % 256
@@ -422,7 +427,7 @@ class pkt_rx_16QAM(gr.hier_block2):
 
         self.throttle = blocks.throttle(gr.sizeof_gr_complex, samp_rate, True)
 
-        self.agc2 = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+        self.agc2 = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0,0)
 
 
         # 1. Matched Filter (RRC Filter)
@@ -436,7 +441,7 @@ class pkt_rx_16QAM(gr.hier_block2):
         self.rrc_rx = filter.fir_filter_ccf(1, rrc_taps)
 
         # 2. AGC (標竿參考功率設為 1.0)        
-        #self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0,2)
 
         # 3. Symbol Timing Sync (Gardner TED)
         self.clock_sync = digital.symbol_sync_cc(
@@ -463,7 +468,7 @@ class pkt_rx_16QAM(gr.hier_block2):
             adapt_after_training=False
         )
 
-        self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
+        #self.agc = analog.agc2_cc(1e-3, 1e-4, 1.0, 1.0)
         
         # 4. Carrier Frequency & Phase Tracking (Costas Loop)
         # loop_bw 設為 0.008，足夠穩穩定鎖定 CFO 且不跳動        
